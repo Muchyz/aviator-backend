@@ -6,7 +6,6 @@ const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
-const twilio = require("twilio");
 
 const app = express();
 const server = http.createServer(app);
@@ -22,11 +21,6 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
-
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
 
 const JWT_SECRET = process.env.JWT_SECRET || "avipesa_secret";
 
@@ -56,20 +50,6 @@ function formatUser(u) {
   };
 }
 
-async function sendSMS(phone, message) {
-  try {
-    await twilioClient.messages.create({
-      body: message,
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to: `+${phone}`,
-    });
-    return true;
-  } catch (err) {
-    console.error("SMS error:", err);
-    return false;
-  }
-}
-
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -79,13 +59,6 @@ async function initDB() {
       phone TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       balance NUMERIC(12,2) DEFAULT 0,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS otp_codes (
-      id SERIAL PRIMARY KEY,
-      phone TEXT NOT NULL,
-      code TEXT NOT NULL,
-      expires_at TIMESTAMPTZ NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS transactions (
@@ -172,62 +145,10 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
   }
 });
 
-app.post("/api/auth/send-otp", async (req, res) => {
-  const { phone } = req.body;
-  if (!phone) return res.status(400).json({ error: "Phone required" });
-  try {
-    const userResult = await pool.query("SELECT id FROM users WHERE phone=$1", [phone]);
-    if (!userResult.rows.length)
-      return res.status(404).json({ error: "No account found with this number" });
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expires = new Date(Date.now() + 1000 * 60 * 10);
-    await pool.query("DELETE FROM otp_codes WHERE phone=$1", [phone]);
-    await pool.query(
-      "INSERT INTO otp_codes (phone,code,expires_at) VALUES($1,$2,$3)",
-      [phone, code, expires]
-    );
-    const sent = await sendSMS(phone, `AviPesa: Your password reset OTP is ${code}. Valid for 10 minutes.`);
-    if (!sent) return res.status(500).json({ error: "Failed to send SMS" });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Failed to send OTP" });
-  }
-});
-
-app.post("/api/auth/verify-otp", async (req, res) => {
-  const { phone, code, newPassword } = req.body;
-  if (!phone || !code || !newPassword)
-    return res.status(400).json({ error: "All fields required" });
-  if (newPassword.length < 6)
-    return res.status(400).json({ error: "Password must be at least 6 characters" });
-  try {
-    const result = await pool.query(
-      "SELECT * FROM otp_codes WHERE phone=$1 AND code=$2",
-      [phone, code]
-    );
-    if (!result.rows.length)
-      return res.status(400).json({ error: "Invalid OTP code" });
-    const row = result.rows[0];
-    if (new Date(row.expires_at) < new Date())
-      return res.status(400).json({ error: "OTP expired. Request a new one." });
-    const hash = await bcrypt.hash(newPassword, 10);
-    await pool.query("UPDATE users SET password_hash=$1 WHERE phone=$2", [hash, phone]);
-    await pool.query("DELETE FROM otp_codes WHERE phone=$1", [phone]);
-    const userResult = await pool.query("SELECT * FROM users WHERE phone=$1", [phone]);
-    const user = userResult.rows[0];
-    const token = signToken(user.id);
-    res.json({ ok: true, token, user: formatUser(user) });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "OTP verification failed" });
-  }
-});
-
 // ─── WALLET ROUTES ────────────────────────────────────────────────────────────
 
 app.post("/api/wallet/deposit", authMiddleware, async (req, res) => {
-  const { amount, phone } = req.body;
+  const { amount } = req.body;
   if (!amount || amount < 10)
     return res.status(400).json({ error: "Minimum deposit is KES 10" });
   try {
@@ -248,7 +169,7 @@ app.post("/api/wallet/deposit", authMiddleware, async (req, res) => {
 });
 
 app.post("/api/wallet/withdraw", authMiddleware, async (req, res) => {
-  const { amount, phone } = req.body;
+  const { amount } = req.body;
   if (!amount || amount < 100)
     return res.status(400).json({ error: "Minimum withdrawal is KES 100" });
   try {
