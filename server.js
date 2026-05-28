@@ -6,8 +6,7 @@ const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
-const crypto = require("crypto");
-const AfricasTalking = require("africastalking");
+const twilio = require("twilio");
 
 const app = express();
 const server = http.createServer(app);
@@ -24,11 +23,10 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-const at = AfricasTalking({
-  apiKey: process.env.AT_API_KEY,
-  username: process.env.AT_USERNAME,
-});
-const sms = at.SMS;
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
 
 const JWT_SECRET = process.env.JWT_SECRET || "avipesa_secret";
 
@@ -60,10 +58,10 @@ function formatUser(u) {
 
 async function sendSMS(phone, message) {
   try {
-    await sms.send({
-      to: [`+${phone}`],
-      message,
-      from: process.env.AT_SENDER_ID || null,
+    await twilioClient.messages.create({
+      body: message,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: `+${phone}`,
     });
     return true;
   } catch (err) {
