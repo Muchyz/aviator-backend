@@ -283,6 +283,9 @@ let gameState = {
 const activeBets = new Map();
 const socketUsers = new Map();
 
+// Store auto cashout targets per socket: socketId -> number
+const autoCashoutTargets = new Map();
+
 function getBetsArray() {
   return [...activeBets.values()].map(b => ({
     id: b.userId || b.socketId,
@@ -311,8 +314,40 @@ function spawnBots() {
   }
 }
 
+// ── perform cashout synchronously inside the tick, returns result or null ──
+async function performCashout(bet, mult, socketId) {
+  if (bet.cashedOut) return null;
+  bet.cashedOut = true;
+  bet.cashMult = mult;
+  const payout = parseFloat((bet.amount * mult).toFixed(2));
+  const profit = parseFloat((payout - bet.amount).toFixed(2));
+  try {
+    const updated = await pool.query(
+      "UPDATE users SET balance=balance+$1 WHERE id=$2 RETURNING balance",
+      [payout, bet.userId]
+    );
+    const newBalance = parseFloat(updated.rows[0].balance);
+    await pool.query(
+      "UPDATE game_bets SET cashed_out=true,cashout_mult=$1,payout=$2 WHERE round_id=$3 AND user_id=$4",
+      [mult, payout, gameState.roundId, bet.userId]
+    );
+    await pool.query(
+      "INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)",
+      [bet.userId, "win", `Win ×${mult.toFixed(2)}`, profit]
+    );
+    return { newBalance, payout, profit, mult };
+  } catch (err) {
+    console.error("Cashout DB error:", err);
+    // rollback in-memory flag so they can retry
+    bet.cashedOut = false;
+    bet.cashMult = null;
+    return null;
+  }
+}
+
 async function startWaiting() {
   activeBets.clear();
+  autoCashoutTargets.clear();
   gameState.state = "waiting";
   gameState.multiplier = 1;
   gameState.countdown = 5;
@@ -342,20 +377,63 @@ function startFlight() {
   gameState.state = "flying";
   gameState.startTime = Date.now();
   gameState.bets = getBetsArray();
-  io.emit("game:flying", { state:"flying", bets:gameState.bets });
-  const tick = setInterval(() => {
+  io.emit("game:flying", { state:"flying", roundId: gameState.roundId, bets:gameState.bets });
+
+  const tick = setInterval(async () => {
     const elapsed = (Date.now() - gameState.startTime) / 1000;
     const m = parseFloat(Math.pow(Math.E, elapsed * 0.35).toFixed(2));
     gameState.multiplier = m;
-    activeBets.forEach((bet) => {
-      if (bet.isBot && !bet.cashedOut && bet.autoCashout && m >= bet.autoCashout) {
+
+    // ── auto cashout: check BEFORE broadcasting so payout uses exact mult ──
+    const cashoutPromises = [];
+
+    activeBets.forEach((bet, key) => {
+      if (bet.cashedOut) return;
+
+      // bots
+      if (bet.isBot && bet.autoCashout && m >= bet.autoCashout) {
         bet.cashedOut = true;
         bet.cashMult = m;
+        return;
+      }
+
+      // real players with auto cashout set
+      if (!bet.isBot && bet.userId) {
+        const target = autoCashoutTargets.get(bet.socketId);
+        if (target && m >= target) {
+          const socketId = bet.socketId;
+          cashoutPromises.push(
+            performCashout(bet, m, socketId).then(result => {
+              if (result) {
+                const sock = io.sockets.sockets.get(socketId);
+                if (sock) {
+                  sock.emit("cashout:result", {
+                    ok: true,
+                    mult: result.mult,
+                    payout: result.payout,
+                    profit: result.profit,
+                    balance: result.newBalance,
+                  });
+                }
+              }
+            })
+          );
+        }
       }
     });
+
+    // wait for all auto cashouts to complete before broadcasting
+    if (cashoutPromises.length > 0) {
+      await Promise.all(cashoutPromises);
+    }
+
     gameState.bets = getBetsArray();
-    io.emit("game:tick", { multiplier:m, bets:gameState.bets });
-    if (m >= gameState.crashPoint) { clearInterval(tick); endRound(m); }
+    io.emit("game:tick", { multiplier: m, bets: gameState.bets });
+
+    if (m >= gameState.crashPoint) {
+      clearInterval(tick);
+      endRound(m);
+    }
   }, 100);
 }
 
@@ -365,6 +443,7 @@ async function endRound(finalMult) {
   gameState.bets = getBetsArray();
   io.emit("game:crashed", { multiplier:finalMult, roundId:gameState.roundId, bets:gameState.bets });
   activeBets.clear();
+  autoCashoutTargets.clear();
   setTimeout(startWaiting, 4000);
 }
 
@@ -378,6 +457,7 @@ io.on("connection", (socket) => {
       socketUsers.set(socket.id, socketUserId);
     } catch {}
   }
+
   socket.emit("game:state", {
     state: gameState.state,
     multiplier: gameState.multiplier,
@@ -386,18 +466,28 @@ io.on("connection", (socket) => {
     bets: gameState.bets,
   });
 
-  socket.on("bet:place", async ({ amount }) => {
+  // Client sends their auto cashout target whenever it changes
+  socket.on("autocashout:set", ({ target }) => {
+    const val = parseFloat(target);
+    if (!isNaN(val) && val >= 1.01) {
+      autoCashoutTargets.set(socket.id, val);
+    } else {
+      autoCashoutTargets.delete(socket.id);
+    }
+  });
+
+  socket.on("bet:place", async ({ amount, panelId }) => {
     if (gameState.state !== "waiting")
-      return socket.emit("bet:result", { ok:false, error:"Betting is closed" });
+      return socket.emit("bet:result", { ok:false, error:"Betting is closed", panelId });
     if (!socketUserId)
-      return socket.emit("bet:result", { ok:false, error:"Please sign in to bet" });
+      return socket.emit("bet:result", { ok:false, error:"Please sign in to bet", panelId });
     if (!amount || amount < 10)
-      return socket.emit("bet:result", { ok:false, error:"Minimum bet is KES 10" });
+      return socket.emit("bet:result", { ok:false, error:"Minimum bet is KES 10", panelId });
     try {
       const userResult = await pool.query("SELECT * FROM users WHERE id=$1", [socketUserId]);
       const user = userResult.rows[0];
       if (!user || parseFloat(user.balance) < amount)
-        return socket.emit("bet:result", { ok:false, error:"Insufficient balance" });
+        return socket.emit("bet:result", { ok:false, error:"Insufficient balance", panelId });
       const updated = await pool.query(
         "UPDATE users SET balance=balance-$1 WHERE id=$2 RETURNING balance",
         [amount, socketUserId]
@@ -411,9 +501,14 @@ io.on("connection", (socket) => {
         "INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)",
         [socketUserId, "bet", `Bet Round #${gameState.roundId}`, -amount]
       );
-      activeBets.set(socket.id, {
+
+      // Use panelId as part of key so dual bets work
+      const betKey = panelId === 2 ? `${socket.id}_2` : socket.id;
+      activeBets.set(betKey, {
         userId: socketUserId,
         socketId: socket.id,
+        betKey,
+        panelId: panelId || 1,
         name: `${user.first_name} ${user.last_name[0]}***`,
         amount,
         cashedOut: false,
@@ -422,47 +517,41 @@ io.on("connection", (socket) => {
       });
       gameState.bets = getBetsArray();
       io.emit("game:bets", gameState.bets);
-      socket.emit("bet:result", { ok:true, balance:newBalance });
+      socket.emit("bet:result", { ok:true, balance:newBalance, amount, panelId });
     } catch (err) {
       console.error(err);
-      socket.emit("bet:result", { ok:false, error:"Bet failed" });
+      socket.emit("bet:result", { ok:false, error:"Bet failed", panelId });
     }
   });
 
-  socket.on("bet:cashout", async () => {
-    const bet = activeBets.get(socket.id);
+  socket.on("bet:cashout", async ({ panelId } = {}) => {
+    const betKey = panelId === 2 ? `${socket.id}_2` : socket.id;
+    const bet = activeBets.get(betKey);
     if (!bet || bet.cashedOut || gameState.state !== "flying")
-      return socket.emit("cashout:result", { ok:false, error:"Cannot cash out now" });
+      return socket.emit("cashout:result", { ok:false, error:"Cannot cash out now", panelId });
+
+    // Use the current server multiplier at the exact moment of request
     const mult = gameState.multiplier;
-    const payout = parseFloat((bet.amount * mult).toFixed(2));
-    const profit = parseFloat((payout - bet.amount).toFixed(2));
-    bet.cashedOut = true;
-    bet.cashMult = mult;
-    try {
-      const updated = await pool.query(
-        "UPDATE users SET balance=balance+$1 WHERE id=$2 RETURNING balance",
-        [payout, bet.userId]
-      );
-      const newBalance = parseFloat(updated.rows[0].balance);
-      await pool.query(
-        "UPDATE game_bets SET cashed_out=true,cashout_mult=$1,payout=$2 WHERE round_id=$3 AND user_id=$4",
-        [mult, payout, gameState.roundId, bet.userId]
-      );
-      await pool.query(
-        "INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)",
-        [bet.userId, "win", `Win ×${mult.toFixed(2)}`, profit]
-      );
+    const result = await performCashout(bet, mult, socket.id);
+    if (result) {
       gameState.bets = getBetsArray();
       io.emit("game:bets", gameState.bets);
-      socket.emit("cashout:result", { ok:true, mult, payout, profit, balance:newBalance });
-    } catch (err) {
-      console.error(err);
-      socket.emit("cashout:result", { ok:false, error:"Cashout failed" });
+      socket.emit("cashout:result", {
+        ok: true,
+        mult: result.mult,
+        payout: result.payout,
+        profit: result.profit,
+        balance: result.newBalance,
+        panelId,
+      });
+    } else {
+      socket.emit("cashout:result", { ok:false, error:"Cashout failed", panelId });
     }
   });
 
   socket.on("disconnect", () => {
     socketUsers.delete(socket.id);
+    autoCashoutTargets.delete(socket.id);
   });
 });
 
