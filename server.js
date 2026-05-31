@@ -269,11 +269,11 @@ function generateCrashPoint() {
   return +(12 + Math.random() * 25).toFixed(2);
 }
 
-// Calculate exact live multiplier from start time
+// Always calculate the true live multiplier from elapsed time
 function getLiveMultiplier() {
   if (!gameState.startTime) return 1;
   const elapsed = (Date.now() - gameState.startTime) / 1000;
-  return parseFloat(Math.pow(Math.E, elapsed * 0.35).toFixed(2));
+  return parseFloat(Math.pow(Math.E, elapsed * 0.35).toFixed(4));
 }
 
 let gameState = {
@@ -289,7 +289,26 @@ let gameState = {
 
 const activeBets = new Map();
 const socketUsers = new Map();
-const autoCashoutTargets = new Map(); // socketId -> { panelId, target }[]
+// socketId -> Map(panelId -> target)
+const autoCashoutTargets = new Map();
+
+function getAutoCashoutTarget(socketId, panelId) {
+  const panels = autoCashoutTargets.get(socketId);
+  if (!panels) return null;
+  return panels.get(panelId) || null;
+}
+
+function setAutoCashoutTarget(socketId, panelId, target) {
+  if (!autoCashoutTargets.has(socketId)) {
+    autoCashoutTargets.set(socketId, new Map());
+  }
+  const panels = autoCashoutTargets.get(socketId);
+  if (target === null) {
+    panels.delete(panelId);
+  } else {
+    panels.set(panelId, target);
+  }
+}
 
 function getBetsArray() {
   return [...activeBets.values()].map(b => ({
@@ -319,7 +338,7 @@ function spawnBots() {
   }
 }
 
-async function performCashout(bet, mult, socketId, panelId) {
+async function performCashout(bet, mult) {
   if (bet.cashedOut) return null;
   bet.cashedOut = true;
   bet.cashMult = mult;
@@ -337,7 +356,7 @@ async function performCashout(bet, mult, socketId, panelId) {
     );
     await pool.query(
       "INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)",
-      [bet.userId, "win", `Win ×${mult.toFixed(2)}`, profit]
+      [bet.userId, "win", `Win x${mult.toFixed(2)}`, profit]
     );
     return { newBalance, payout, profit, mult };
   } catch (err) {
@@ -367,7 +386,12 @@ async function startWaiting() {
   }
   spawnBots();
   gameState.bets = getBetsArray();
-  io.emit("game:waiting", { state:"waiting", countdown:gameState.countdown, history:gameState.history, bets:gameState.bets });
+  io.emit("game:waiting", {
+    state: "waiting",
+    countdown: gameState.countdown,
+    history: gameState.history,
+    bets: gameState.bets,
+  });
   let c = 5;
   const cdInterval = setInterval(() => {
     c--;
@@ -381,37 +405,46 @@ function startFlight() {
   gameState.state = "flying";
   gameState.startTime = Date.now();
   gameState.bets = getBetsArray();
-  io.emit("game:flying", { state:"flying", roundId: gameState.roundId, bets:gameState.bets });
+  io.emit("game:flying", {
+    state: "flying",
+    roundId: gameState.roundId,
+    bets: gameState.bets,
+  });
+
+  // Broadcast tick to clients every 100ms but check auto cashouts every 50ms
+  let lastBroadcast = 0;
 
   const tick = setInterval(async () => {
-    // Always calculate multiplier from real elapsed time for accuracy
+    const now = Date.now();
     const m = getLiveMultiplier();
     gameState.multiplier = m;
 
     const cashoutPromises = [];
 
-    activeBets.forEach((bet, key) => {
+    activeBets.forEach((bet) => {
       if (bet.cashedOut) return;
 
-      // bots auto cashout
+      // bots
       if (bet.isBot && bet.autoCashout && m >= bet.autoCashout) {
         bet.cashedOut = true;
-        bet.cashMult = m;
+        // clamp to their target so bot always hits exact value
+        bet.cashMult = bet.autoCashout;
         return;
       }
 
-      // real players auto cashout - check targets for this socket
+      // real players auto cashout
       if (!bet.isBot && bet.userId) {
-        const targets = autoCashoutTargets.get(bet.socketId) || [];
-        const match = targets.find(t => t.panelId === bet.panelId && t.target !== null && m >= t.target);
-        if (match) {
-          // Use the exact target value, not the current tick value
-          const exactMult = match.target;
+        const target = getAutoCashoutTarget(bet.socketId, bet.panelId);
+        if (target !== null && m >= target) {
+          // Use exact target value the player set, not the current tick value
+          const exactMult = parseFloat(target.toFixed(2));
           const socketId = bet.socketId;
           const panelId = bet.panelId;
           cashoutPromises.push(
-            performCashout(bet, exactMult, socketId, panelId).then(result => {
+            performCashout(bet, exactMult).then(result => {
               if (result) {
+                // Remove target so it doesn't fire again
+                setAutoCashoutTarget(socketId, panelId, null);
                 const sock = io.sockets.sockets.get(socketId);
                 if (sock) {
                   sock.emit("cashout:result", {
@@ -434,21 +467,29 @@ function startFlight() {
       await Promise.all(cashoutPromises);
     }
 
-    gameState.bets = getBetsArray();
-    io.emit("game:tick", { multiplier: m, bets: gameState.bets });
+    // Broadcast to clients at 100ms but run auto cashout checks at 50ms
+    if (now - lastBroadcast >= 100) {
+      lastBroadcast = now;
+      gameState.bets = getBetsArray();
+      io.emit("game:tick", { multiplier: parseFloat(m.toFixed(2)), bets: gameState.bets });
+    }
 
     if (m >= gameState.crashPoint) {
       clearInterval(tick);
-      endRound(m);
+      endRound(parseFloat(m.toFixed(2)));
     }
-  }, 100);
+  }, 50);
 }
 
 async function endRound(finalMult) {
   gameState.state = "crashed";
   gameState.history = [finalMult, ...gameState.history].slice(0, 12);
   gameState.bets = getBetsArray();
-  io.emit("game:crashed", { multiplier:finalMult, roundId:gameState.roundId, bets:gameState.bets });
+  io.emit("game:crashed", {
+    multiplier: finalMult,
+    roundId: gameState.roundId,
+    bets: gameState.bets,
+  });
   activeBets.clear();
   autoCashoutTargets.clear();
   setTimeout(startWaiting, 4000);
@@ -473,30 +514,28 @@ io.on("connection", (socket) => {
     bets: gameState.bets,
   });
 
-  // Store auto cashout target per panel per socket
   socket.on("autocashout:set", ({ target, panelId }) => {
     const pid = panelId || 1;
-    const existing = autoCashoutTargets.get(socket.id) || [];
-    const filtered = existing.filter(t => t.panelId !== pid);
     const val = parseFloat(target);
     if (!isNaN(val) && val >= 1.01) {
-      filtered.push({ panelId: pid, target: val });
+      setAutoCashoutTarget(socket.id, pid, val);
+    } else {
+      setAutoCashoutTarget(socket.id, pid, null);
     }
-    autoCashoutTargets.set(socket.id, filtered);
   });
 
   socket.on("bet:place", async ({ amount, panelId }) => {
     if (gameState.state !== "waiting")
-      return socket.emit("bet:result", { ok:false, error:"Betting is closed", panelId });
+      return socket.emit("bet:result", { ok: false, error: "Betting is closed", panelId });
     if (!socketUserId)
-      return socket.emit("bet:result", { ok:false, error:"Please sign in to bet", panelId });
+      return socket.emit("bet:result", { ok: false, error: "Please sign in to bet", panelId });
     if (!amount || amount < 10)
-      return socket.emit("bet:result", { ok:false, error:"Minimum bet is KES 10", panelId });
+      return socket.emit("bet:result", { ok: false, error: "Minimum bet is KES 10", panelId });
     try {
       const userResult = await pool.query("SELECT * FROM users WHERE id=$1", [socketUserId]);
       const user = userResult.rows[0];
       if (!user || parseFloat(user.balance) < amount)
-        return socket.emit("bet:result", { ok:false, error:"Insufficient balance", panelId });
+        return socket.emit("bet:result", { ok: false, error: "Insufficient balance", panelId });
       const updated = await pool.query(
         "UPDATE users SET balance=balance-$1 WHERE id=$2 RETURNING balance",
         [amount, socketUserId]
@@ -510,7 +549,6 @@ io.on("connection", (socket) => {
         "INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)",
         [socketUserId, "bet", `Bet Round #${gameState.roundId}`, -amount]
       );
-
       const betKey = panelId === 2 ? `${socket.id}_2` : socket.id;
       activeBets.set(betKey, {
         userId: socketUserId,
@@ -525,26 +563,27 @@ io.on("connection", (socket) => {
       });
       gameState.bets = getBetsArray();
       io.emit("game:bets", gameState.bets);
-      socket.emit("bet:result", { ok:true, balance:newBalance, amount, panelId });
+      socket.emit("bet:result", { ok: true, balance: newBalance, amount, panelId });
     } catch (err) {
       console.error(err);
-      socket.emit("bet:result", { ok:false, error:"Bet failed", panelId });
+      socket.emit("bet:result", { ok: false, error: "Bet failed", panelId });
     }
   });
 
   socket.on("bet:cashout", async ({ panelId } = {}) => {
     if (gameState.state !== "flying")
-      return socket.emit("cashout:result", { ok:false, error:"Cannot cash out now", panelId });
+      return socket.emit("cashout:result", { ok: false, error: "Cannot cash out now", panelId });
 
     const betKey = panelId === 2 ? `${socket.id}_2` : socket.id;
     const bet = activeBets.get(betKey);
+
     if (!bet || bet.cashedOut)
-      return socket.emit("cashout:result", { ok:false, error:"Cannot cash out now", panelId });
+      return socket.emit("cashout:result", { ok: false, error: "Cannot cash out now", panelId });
 
-    // Calculate exact live multiplier at the moment of this request
-    const mult = getLiveMultiplier();
+    // Get exact live multiplier at this precise moment
+    const mult = parseFloat(getLiveMultiplier().toFixed(2));
 
-    const result = await performCashout(bet, mult, socket.id, panelId);
+    const result = await performCashout(bet, mult);
     if (result) {
       gameState.bets = getBetsArray();
       io.emit("game:bets", gameState.bets);
@@ -557,7 +596,7 @@ io.on("connection", (socket) => {
         panelId,
       });
     } else {
-      socket.emit("cashout:result", { ok:false, error:"Cashout failed", panelId });
+      socket.emit("cashout:result", { ok: false, error: "Cashout failed", panelId });
     }
   });
 
