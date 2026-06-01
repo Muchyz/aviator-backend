@@ -280,7 +280,7 @@ function msUntilTarget(target) {
   const tSeconds = Math.log(target) / 0.35;
   const fireAt = gameState.startTime + tSeconds * 1000;
   const delay = fireAt - Date.now();
-  console.log(`[AUTO] msUntilTarget(${target}) => delay=${delay.toFixed(0)}ms fireAt=${new Date(fireAt).toISOString()}`);
+  console.log(`[AUTO] msUntilTarget(${target}) => delay=${delay.toFixed(0)}ms`);
   return Math.max(0, delay);
 }
 
@@ -297,17 +297,22 @@ let gameState = {
 
 const activeBets = new Map();
 const socketUsers = new Map();
+
+// socketId -> Map(panelId -> target)
 const pendingAutoCashouts = new Map();
+
+// socketId -> Map(panelId -> timerId)
 const scheduledTimers = new Map();
 
 function storePendingTarget(socketId, panelId, target) {
   if (!pendingAutoCashouts.has(socketId)) {
     pendingAutoCashouts.set(socketId, new Map());
   }
+  const panels = pendingAutoCashouts.get(socketId);
   if (target === null) {
-    pendingAutoCashouts.get(socketId).delete(panelId);
+    panels.delete(panelId);
   } else {
-    pendingAutoCashouts.get(socketId).set(panelId, target);
+    panels.set(panelId, target);
   }
   console.log(`[AUTO] storePendingTarget socket=${socketId} panel=${panelId} target=${target}`);
 }
@@ -336,18 +341,18 @@ function scheduleTimer(socketId, panelId, target) {
   console.log(`[AUTO] scheduleTimer socket=${socketId} panel=${panelId} target=${target} delay=${delay.toFixed(0)}ms`);
 
   const timerId = setTimeout(async () => {
-    console.log(`[AUTO] FIRED socket=${socketId} panel=${panelId} target=${target} currentMult=${getLiveMultiplier()} gameState=${gameState.state}`);
-    if (gameState.state !== "flying") {
-      console.log(`[AUTO] SKIPPED not flying`);
-      return;
-    }
+    console.log(`[AUTO] FIRED socket=${socketId} panel=${panelId} target=${target} gameState=${gameState.state}`);
+    if (gameState.state !== "flying") return;
+
+    // panel 1 uses socketId as key, panel 2 uses socketId_2
     const betKey = panelId === 2 ? `${socketId}_2` : socketId;
+    console.log(`[AUTO] looking for betKey=${betKey}`);
     const bet = activeBets.get(betKey);
     console.log(`[AUTO] bet found=${!!bet} cashedOut=${bet ? bet.cashedOut : "N/A"}`);
     if (!bet || bet.cashedOut) return;
 
     const exactMult = parseFloat(target.toFixed(2));
-    console.log(`[AUTO] performing cashout at exactMult=${exactMult}`);
+    console.log(`[AUTO] cashing out at exactMult=${exactMult}`);
     const result = await performCashout(bet, exactMult);
     if (result) {
       gameState.bets = getBetsArray();
@@ -362,12 +367,8 @@ function scheduleTimer(socketId, panelId, target) {
           balance: result.newBalance,
           panelId,
         });
-        console.log(`[AUTO] cashout:result sent to socket=${socketId} mult=${result.mult} payout=${result.payout}`);
-      } else {
-        console.log(`[AUTO] socket not found socketId=${socketId}`);
+        console.log(`[AUTO] cashout:result sent panel=${panelId} mult=${result.mult}`);
       }
-    } else {
-      console.log(`[AUTO] performCashout returned null`);
     }
   }, delay);
 
@@ -407,10 +408,10 @@ function spawnBots() {
 
 async function performCashout(bet, mult) {
   if (bet.cashedOut) {
-    console.log(`[CASHOUT] already cashed out, skipping`);
+    console.log(`[CASHOUT] already cashed out skipping`);
     return null;
   }
-  console.log(`[CASHOUT] performing userId=${bet.userId} amount=${bet.amount} mult=${mult}`);
+  console.log(`[CASHOUT] userId=${bet.userId} amount=${bet.amount} mult=${mult}`);
   bet.cashedOut = true;
   bet.cashMult = mult;
   const payout = parseFloat((bet.amount * mult).toFixed(2));
@@ -429,7 +430,7 @@ async function performCashout(bet, mult) {
       "INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)",
       [bet.userId, "win", `Win x${mult.toFixed(2)}`, profit]
     );
-    console.log(`[CASHOUT] success newBalance=${newBalance} payout=${payout} profit=${profit}`);
+    console.log(`[CASHOUT] success newBalance=${newBalance} payout=${payout}`);
     return { newBalance, payout, profit, mult };
   } catch (err) {
     console.error("[CASHOUT] DB error:", err);
@@ -490,6 +491,7 @@ function startFlight() {
   gameState.startTime = Date.now();
   gameState.bets = getBetsArray();
   console.log(`[GAME] flying startTime=${gameState.startTime} crashPoint=${gameState.crashPoint}`);
+
   io.emit("game:flying", {
     state: "flying",
     roundId: gameState.roundId,
@@ -500,8 +502,10 @@ function startFlight() {
   console.log(`[AUTO] scheduling ${pendingAutoCashouts.size} pending auto cashouts`);
   pendingAutoCashouts.forEach((panels, socketId) => {
     panels.forEach((target, panelId) => {
-      console.log(`[AUTO] scheduling pending socketId=${socketId} panelId=${panelId} target=${target}`);
-      scheduleTimer(socketId, panelId, target);
+      // panelId stored as number, ensure it is treated as number
+      const pid = parseInt(panelId);
+      console.log(`[AUTO] scheduling pending socketId=${socketId} panelId=${pid} target=${target}`);
+      scheduleTimer(socketId, pid, target);
     });
   });
 
@@ -569,7 +573,8 @@ io.on("connection", (socket) => {
   });
 
   socket.on("autocashout:set", ({ target, panelId }) => {
-    const pid = panelId || 1;
+    // Force panelId to be a proper integer, default to 1
+    const pid = parseInt(panelId) === 2 ? 2 : 1;
     const val = parseFloat(target);
     console.log(`[AUTO] autocashout:set socketId=${socket.id} panelId=${pid} target=${target} val=${val} gameState=${gameState.state}`);
     if (!isNaN(val) && val >= 1.01) {
@@ -584,18 +589,19 @@ io.on("connection", (socket) => {
   });
 
   socket.on("bet:place", async ({ amount, panelId }) => {
-    console.log(`[BET] bet:place socketId=${socket.id} userId=${socketUserId} amount=${amount} panelId=${panelId}`);
+    const pid = parseInt(panelId) === 2 ? 2 : 1;
+    console.log(`[BET] bet:place socketId=${socket.id} userId=${socketUserId} amount=${amount} panelId=${pid}`);
     if (gameState.state !== "waiting")
-      return socket.emit("bet:result", { ok: false, error: "Betting is closed", panelId });
+      return socket.emit("bet:result", { ok: false, error: "Betting is closed", panelId: pid });
     if (!socketUserId)
-      return socket.emit("bet:result", { ok: false, error: "Please sign in to bet", panelId });
+      return socket.emit("bet:result", { ok: false, error: "Please sign in to bet", panelId: pid });
     if (!amount || amount < 10)
-      return socket.emit("bet:result", { ok: false, error: "Minimum bet is KES 10", panelId });
+      return socket.emit("bet:result", { ok: false, error: "Minimum bet is KES 10", panelId: pid });
     try {
       const userResult = await pool.query("SELECT * FROM users WHERE id=$1", [socketUserId]);
       const user = userResult.rows[0];
       if (!user || parseFloat(user.balance) < amount)
-        return socket.emit("bet:result", { ok: false, error: "Insufficient balance", panelId });
+        return socket.emit("bet:result", { ok: false, error: "Insufficient balance", panelId: pid });
       const updated = await pool.query(
         "UPDATE users SET balance=balance-$1 WHERE id=$2 RETURNING balance",
         [amount, socketUserId]
@@ -609,12 +615,14 @@ io.on("connection", (socket) => {
         "INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)",
         [socketUserId, "bet", `Bet Round #${gameState.roundId}`, -amount]
       );
-      const betKey = panelId === 2 ? `${socket.id}_2` : socket.id;
+
+      // panel 1 key = socketId, panel 2 key = socketId_2
+      const betKey = pid === 2 ? `${socket.id}_2` : socket.id;
       activeBets.set(betKey, {
         userId: socketUserId,
         socketId: socket.id,
         betKey,
-        panelId: panelId || 1,
+        panelId: pid,
         name: `${user.first_name} ${user.last_name[0]}***`,
         amount,
         cashedOut: false,
@@ -623,29 +631,30 @@ io.on("connection", (socket) => {
       });
       gameState.bets = getBetsArray();
       io.emit("game:bets", gameState.bets);
-      socket.emit("bet:result", { ok: true, balance: newBalance, amount, panelId });
+      socket.emit("bet:result", { ok: true, balance: newBalance, amount, panelId: pid });
       console.log(`[BET] placed betKey=${betKey} amount=${amount} newBalance=${newBalance}`);
     } catch (err) {
       console.error("[BET] error:", err);
-      socket.emit("bet:result", { ok: false, error: "Bet failed", panelId });
+      socket.emit("bet:result", { ok: false, error: "Bet failed", panelId: pid });
     }
   });
 
   socket.on("bet:cashout", async ({ panelId } = {}) => {
+    const pid = parseInt(panelId) === 2 ? 2 : 1;
     const mult = parseFloat(getLiveMultiplier().toFixed(2));
-    console.log(`[CASHOUT] bet:cashout socketId=${socket.id} panelId=${panelId} liveMult=${mult} gameState=${gameState.state}`);
+    console.log(`[CASHOUT] bet:cashout socketId=${socket.id} panelId=${pid} liveMult=${mult} gameState=${gameState.state}`);
 
     if (gameState.state !== "flying")
-      return socket.emit("cashout:result", { ok: false, error: "Cannot cash out now", panelId });
+      return socket.emit("cashout:result", { ok: false, error: "Cannot cash out now", panelId: pid });
 
-    const betKey = panelId === 2 ? `${socket.id}_2` : socket.id;
+    const betKey = pid === 2 ? `${socket.id}_2` : socket.id;
     const bet = activeBets.get(betKey);
     console.log(`[CASHOUT] betKey=${betKey} found=${!!bet} cashedOut=${bet ? bet.cashedOut : "N/A"}`);
 
     if (!bet || bet.cashedOut)
-      return socket.emit("cashout:result", { ok: false, error: "Cannot cash out now", panelId });
+      return socket.emit("cashout:result", { ok: false, error: "Cannot cash out now", panelId: pid });
 
-    cancelTimer(socket.id, panelId || 1);
+    cancelTimer(socket.id, pid);
 
     const result = await performCashout(bet, mult);
     if (result) {
@@ -657,12 +666,11 @@ io.on("connection", (socket) => {
         payout: result.payout,
         profit: result.profit,
         balance: result.newBalance,
-        panelId,
+        panelId: pid,
       });
-      console.log(`[CASHOUT] success sent to client mult=${result.mult}`);
+      console.log(`[CASHOUT] success mult=${result.mult}`);
     } else {
-      socket.emit("cashout:result", { ok: false, error: "Cashout failed", panelId });
-      console.log(`[CASHOUT] failed`);
+      socket.emit("cashout:result", { ok: false, error: "Cashout failed", panelId: pid });
     }
   });
 
