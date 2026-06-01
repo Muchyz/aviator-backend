@@ -289,8 +289,11 @@ let gameState = {
 const activeBets = new Map();
 const socketUsers = new Map();
 
-// socketId -> Map(panelId -> target)  — persists across waiting/flying
+// socketId -> Map(panelId -> target)
 const autoCashoutTargets = new Map();
+
+// In-memory balance cache to avoid DB round-trip on cashout response
+const balanceCache = new Map(); // userId -> balance
 
 function setAutoCashoutTarget(socketId, panelId, target) {
   if (!autoCashoutTargets.has(socketId)) {
@@ -339,41 +342,50 @@ function spawnBots() {
   }
 }
 
-async function performCashout(bet, mult) {
+// Performs DB writes in background — does NOT block the response
+function persistCashout(userId, roundId, mult, payout, profit) {
+  pool.query(
+    "UPDATE users SET balance=balance+$1 WHERE id=$2",
+    [payout, userId]
+  ).then(() =>
+    pool.query(
+      "UPDATE game_bets SET cashed_out=true,cashout_mult=$1,payout=$2 WHERE round_id=$3 AND user_id=$4",
+      [mult, payout, roundId, userId]
+    )
+  ).then(() =>
+    pool.query(
+      "INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)",
+      [userId, "win", `Win x${mult.toFixed(2)}`, profit]
+    )
+  ).catch(err => {
+    console.error("[CASHOUT] DB persist error:", err);
+  });
+}
+
+// Instant in-memory cashout — responds immediately, writes DB in background
+function performCashout(bet, mult) {
   if (bet.cashedOut) {
     console.log(`[CASHOUT] already cashed out — skipping`);
     return null;
   }
-  // Mark immediately to prevent race conditions
+
+  // Lock immediately to prevent any race (auto-tick vs manual)
   bet.cashedOut = true;
   bet.cashMult = mult;
 
-  console.log(`[CASHOUT] userId=${bet.userId} amount=${bet.amount} mult=${mult}`);
   const payout = parseFloat((bet.amount * mult).toFixed(2));
   const profit = parseFloat((payout - bet.amount).toFixed(2));
-  try {
-    const updated = await pool.query(
-      "UPDATE users SET balance=balance+$1 WHERE id=$2 RETURNING balance",
-      [payout, bet.userId]
-    );
-    const newBalance = parseFloat(updated.rows[0].balance);
-    await pool.query(
-      "UPDATE game_bets SET cashed_out=true,cashout_mult=$1,payout=$2 WHERE round_id=$3 AND user_id=$4",
-      [mult, payout, gameState.roundId, bet.userId]
-    );
-    await pool.query(
-      "INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)",
-      [bet.userId, "win", `Win x${mult.toFixed(2)}`, profit]
-    );
-    console.log(`[CASHOUT] success newBalance=${newBalance} payout=${payout}`);
-    return { newBalance, payout, profit, mult };
-  } catch (err) {
-    console.error("[CASHOUT] DB error:", err);
-    // Rollback the in-memory flag so they can try again
-    bet.cashedOut = false;
-    bet.cashMult = null;
-    return null;
-  }
+
+  // Update in-memory balance cache instantly
+  const cachedBal = balanceCache.get(bet.userId) || 0;
+  const newBalance = parseFloat((cachedBal + payout).toFixed(2));
+  balanceCache.set(bet.userId, newBalance);
+
+  // Fire-and-forget DB writes — don't await
+  persistCashout(bet.userId, gameState.roundId, mult, payout, profit);
+
+  console.log(`[CASHOUT] instant userId=${bet.userId} mult=${mult} payout=${payout} newBalance=${newBalance}`);
+  return { newBalance, payout, profit, mult };
 }
 
 async function startWaiting() {
@@ -435,7 +447,6 @@ function startFlight() {
   // Schedule bot cashouts
   activeBets.forEach((bet) => {
     if (!bet.isBot || !bet.autoCashout) return;
-    // compute delay for bot auto-cashout
     const tSeconds = Math.log(bet.autoCashout) / 0.35;
     const delay = Math.max(0, tSeconds * 1000);
     setTimeout(() => {
@@ -449,7 +460,7 @@ function startFlight() {
     const m = getLiveMultiplier();
     gameState.multiplier = m;
 
-    // ── check auto-cashouts for real users on every tick ──────────────────
+    // Check auto-cashouts for real users on every tick
     for (const [betKey, bet] of activeBets) {
       if (bet.isBot || bet.cashedOut) continue;
 
@@ -457,7 +468,7 @@ function startFlight() {
       if (target !== null && m >= target) {
         console.log(`[AUTO] triggering betKey=${betKey} target=${target} m=${m}`);
         const cashMult = parseFloat(target.toFixed(2));
-        const result = await performCashout(bet, cashMult);
+        const result = performCashout(bet, cashMult); // now synchronous
         if (result) {
           gameState.bets = getBetsArray();
           io.emit("game:bets", gameState.bets);
@@ -471,7 +482,6 @@ function startFlight() {
               balance: result.newBalance,
               panelId: bet.panelId,
             });
-            console.log(`[AUTO] cashout:result sent panelId=${bet.panelId} mult=${result.mult}`);
           }
         }
       }
@@ -513,6 +523,13 @@ io.on("connection", (socket) => {
       socketUserId = decoded.userId;
       socketUsers.set(socket.id, socketUserId);
       console.log(`[SOCKET] connected userId=${socketUserId} socketId=${socket.id}`);
+
+      // Load balance into cache
+      pool.query("SELECT balance FROM users WHERE id=$1", [socketUserId])
+        .then(r => {
+          if (r.rows.length) balanceCache.set(socketUserId, parseFloat(r.rows[0].balance));
+        })
+        .catch(() => {});
     } catch {}
   } else {
     console.log(`[SOCKET] connected no token socketId=${socket.id}`);
@@ -526,7 +543,6 @@ io.on("connection", (socket) => {
     bets: gameState.bets,
   });
 
-  // Client sets or clears auto-cashout target for a panel
   socket.on("autocashout:set", ({ target, panelId }) => {
     const pid = parseInt(panelId) === 2 ? 2 : 1;
     const val = target !== null && target !== undefined ? parseFloat(target) : null;
@@ -557,6 +573,10 @@ io.on("connection", (socket) => {
         [amount, socketUserId]
       );
       const newBalance = parseFloat(updated.rows[0].balance);
+
+      // Keep cache in sync after bet deduction
+      balanceCache.set(socketUserId, newBalance);
+
       await pool.query(
         "INSERT INTO game_bets (round_id,user_id,amount) VALUES($1,$2,$3)",
         [gameState.roundId, socketUserId, amount]
@@ -588,8 +608,9 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("bet:cashout", async ({ panelId } = {}) => {
+  socket.on("bet:cashout", ({ panelId } = {}) => {
     const pid = parseInt(panelId) === 2 ? 2 : 1;
+    // Capture multiplier the instant the event arrives — before any await
     const mult = parseFloat(getLiveMultiplier().toFixed(2));
     console.log(`[CASHOUT] bet:cashout socketId=${socket.id} panelId=${pid} liveMult=${mult} gameState=${gameState.state}`);
 
@@ -603,10 +624,11 @@ io.on("connection", (socket) => {
     if (!bet || bet.cashedOut)
       return socket.emit("cashout:result", { ok: false, error: "Cannot cash out now", panelId: pid });
 
-    // Clear auto-cashout target so tick loop doesn't fire again
+    // Clear auto-cashout so tick loop won't fire after this
     setAutoCashoutTarget(socket.id, pid, null);
 
-    const result = await performCashout(bet, mult);
+    // Synchronous — responds instantly, DB writes happen in background
+    const result = performCashout(bet, mult);
     if (result) {
       gameState.bets = getBetsArray();
       io.emit("game:bets", gameState.bets);
@@ -618,7 +640,7 @@ io.on("connection", (socket) => {
         balance: result.newBalance,
         panelId: pid,
       });
-      console.log(`[CASHOUT] success mult=${result.mult}`);
+      console.log(`[CASHOUT] instant response sent mult=${result.mult}`);
     } else {
       socket.emit("cashout:result", { ok: false, error: "Cashout failed", panelId: pid });
     }
