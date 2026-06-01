@@ -275,15 +275,6 @@ function getLiveMultiplier() {
   return parseFloat(Math.pow(Math.E, elapsed * 0.35).toFixed(4));
 }
 
-function msUntilTarget(target) {
-  if (!gameState.startTime) return 0;
-  const tSeconds = Math.log(target) / 0.35;
-  const fireAt = gameState.startTime + tSeconds * 1000;
-  const delay = fireAt - Date.now();
-  console.log(`[AUTO] msUntilTarget(${target}) => delay=${delay.toFixed(0)}ms`);
-  return Math.max(0, delay);
-}
-
 let gameState = {
   state: "waiting",
   multiplier: 1,
@@ -298,84 +289,26 @@ let gameState = {
 const activeBets = new Map();
 const socketUsers = new Map();
 
-// socketId -> Map(panelId -> target)
-const pendingAutoCashouts = new Map();
+// socketId -> Map(panelId -> target)  — persists across waiting/flying
+const autoCashoutTargets = new Map();
 
-// socketId -> Map(panelId -> timerId)
-const scheduledTimers = new Map();
-
-function storePendingTarget(socketId, panelId, target) {
-  if (!pendingAutoCashouts.has(socketId)) {
-    pendingAutoCashouts.set(socketId, new Map());
+function setAutoCashoutTarget(socketId, panelId, target) {
+  if (!autoCashoutTargets.has(socketId)) {
+    autoCashoutTargets.set(socketId, new Map());
   }
-  const panels = pendingAutoCashouts.get(socketId);
-  if (target === null) {
+  const panels = autoCashoutTargets.get(socketId);
+  if (target === null || target === undefined) {
     panels.delete(panelId);
   } else {
     panels.set(panelId, target);
   }
-  console.log(`[AUTO] storePendingTarget socket=${socketId} panel=${panelId} target=${target}`);
+  console.log(`[AUTO] set socketId=${socketId} panelId=${panelId} target=${target}`);
 }
 
-function cancelTimer(socketId, panelId) {
-  const panels = scheduledTimers.get(socketId);
-  if (!panels) return;
-  const timerId = panels.get(panelId);
-  if (timerId !== undefined) {
-    clearTimeout(timerId);
-    panels.delete(panelId);
-    console.log(`[AUTO] cancelTimer socket=${socketId} panel=${panelId}`);
-  }
-}
-
-function cancelAllTimers() {
-  scheduledTimers.forEach((panels) => {
-    panels.forEach((timerId) => clearTimeout(timerId));
-  });
-  scheduledTimers.clear();
-}
-
-function scheduleTimer(socketId, panelId, target) {
-  cancelTimer(socketId, panelId);
-  const delay = msUntilTarget(target);
-  console.log(`[AUTO] scheduleTimer socket=${socketId} panel=${panelId} target=${target} delay=${delay.toFixed(0)}ms`);
-
-  const timerId = setTimeout(async () => {
-    console.log(`[AUTO] FIRED socket=${socketId} panel=${panelId} target=${target} gameState=${gameState.state}`);
-    if (gameState.state !== "flying") return;
-
-    // panel 1 uses socketId as key, panel 2 uses socketId_2
-    const betKey = panelId === 2 ? `${socketId}_2` : socketId;
-    console.log(`[AUTO] looking for betKey=${betKey}`);
-    const bet = activeBets.get(betKey);
-    console.log(`[AUTO] bet found=${!!bet} cashedOut=${bet ? bet.cashedOut : "N/A"}`);
-    if (!bet || bet.cashedOut) return;
-
-    const exactMult = parseFloat(target.toFixed(2));
-    console.log(`[AUTO] cashing out at exactMult=${exactMult}`);
-    const result = await performCashout(bet, exactMult);
-    if (result) {
-      gameState.bets = getBetsArray();
-      io.emit("game:bets", gameState.bets);
-      const sock = io.sockets.sockets.get(socketId);
-      if (sock) {
-        sock.emit("cashout:result", {
-          ok: true,
-          mult: result.mult,
-          payout: result.payout,
-          profit: result.profit,
-          balance: result.newBalance,
-          panelId,
-        });
-        console.log(`[AUTO] cashout:result sent panel=${panelId} mult=${result.mult}`);
-      }
-    }
-  }, delay);
-
-  if (!scheduledTimers.has(socketId)) {
-    scheduledTimers.set(socketId, new Map());
-  }
-  scheduledTimers.get(socketId).set(panelId, timerId);
+function getAutoCashoutTarget(socketId, panelId) {
+  const panels = autoCashoutTargets.get(socketId);
+  if (!panels) return null;
+  return panels.get(panelId) || null;
 }
 
 function getBetsArray() {
@@ -408,12 +341,14 @@ function spawnBots() {
 
 async function performCashout(bet, mult) {
   if (bet.cashedOut) {
-    console.log(`[CASHOUT] already cashed out skipping`);
+    console.log(`[CASHOUT] already cashed out — skipping`);
     return null;
   }
-  console.log(`[CASHOUT] userId=${bet.userId} amount=${bet.amount} mult=${mult}`);
+  // Mark immediately to prevent race conditions
   bet.cashedOut = true;
   bet.cashMult = mult;
+
+  console.log(`[CASHOUT] userId=${bet.userId} amount=${bet.amount} mult=${mult}`);
   const payout = parseFloat((bet.amount * mult).toFixed(2));
   const profit = parseFloat((payout - bet.amount).toFixed(2));
   try {
@@ -434,6 +369,7 @@ async function performCashout(bet, mult) {
     return { newBalance, payout, profit, mult };
   } catch (err) {
     console.error("[CASHOUT] DB error:", err);
+    // Rollback the in-memory flag so they can try again
     bet.cashedOut = false;
     bet.cashMult = null;
     return null;
@@ -441,9 +377,7 @@ async function performCashout(bet, mult) {
 }
 
 async function startWaiting() {
-  cancelAllTimers();
   activeBets.clear();
-  pendingAutoCashouts.clear();
 
   gameState.state = "waiting";
   gameState.multiplier = 1;
@@ -498,21 +432,12 @@ function startFlight() {
     bets: gameState.bets,
   });
 
-  // Schedule all pending auto cashouts now that startTime is known
-  console.log(`[AUTO] scheduling ${pendingAutoCashouts.size} pending auto cashouts`);
-  pendingAutoCashouts.forEach((panels, socketId) => {
-    panels.forEach((target, panelId) => {
-      // panelId stored as number, ensure it is treated as number
-      const pid = parseInt(panelId);
-      console.log(`[AUTO] scheduling pending socketId=${socketId} panelId=${pid} target=${target}`);
-      scheduleTimer(socketId, pid, target);
-    });
-  });
-
   // Schedule bot cashouts
   activeBets.forEach((bet) => {
     if (!bet.isBot || !bet.autoCashout) return;
-    const delay = msUntilTarget(bet.autoCashout);
+    // compute delay for bot auto-cashout
+    const tSeconds = Math.log(bet.autoCashout) / 0.35;
+    const delay = Math.max(0, tSeconds * 1000);
     setTimeout(() => {
       if (bet.cashedOut || gameState.state !== "flying") return;
       bet.cashedOut = true;
@@ -520,14 +445,44 @@ function startFlight() {
     }, delay);
   });
 
-  const tick = setInterval(() => {
+  const tick = setInterval(async () => {
     const m = getLiveMultiplier();
     gameState.multiplier = m;
+
+    // ── check auto-cashouts for real users on every tick ──────────────────
+    for (const [betKey, bet] of activeBets) {
+      if (bet.isBot || bet.cashedOut) continue;
+
+      const target = getAutoCashoutTarget(bet.socketId, bet.panelId);
+      if (target !== null && m >= target) {
+        console.log(`[AUTO] triggering betKey=${betKey} target=${target} m=${m}`);
+        const cashMult = parseFloat(target.toFixed(2));
+        const result = await performCashout(bet, cashMult);
+        if (result) {
+          gameState.bets = getBetsArray();
+          io.emit("game:bets", gameState.bets);
+          const sock = io.sockets.sockets.get(bet.socketId);
+          if (sock) {
+            sock.emit("cashout:result", {
+              ok: true,
+              mult: result.mult,
+              payout: result.payout,
+              profit: result.profit,
+              balance: result.newBalance,
+              panelId: bet.panelId,
+            });
+            console.log(`[AUTO] cashout:result sent panelId=${bet.panelId} mult=${result.mult}`);
+          }
+        }
+      }
+    }
+
     gameState.bets = getBetsArray();
     io.emit("game:tick", {
       multiplier: parseFloat(m.toFixed(2)),
       bets: gameState.bets,
     });
+
     if (m >= gameState.crashPoint) {
       clearInterval(tick);
       endRound(parseFloat(m.toFixed(2)));
@@ -536,7 +491,6 @@ function startFlight() {
 }
 
 async function endRound(finalMult) {
-  cancelAllTimers();
   gameState.state = "crashed";
   gameState.history = [finalMult, ...gameState.history].slice(0, 12);
   gameState.bets = getBetsArray();
@@ -572,19 +526,15 @@ io.on("connection", (socket) => {
     bets: gameState.bets,
   });
 
+  // Client sets or clears auto-cashout target for a panel
   socket.on("autocashout:set", ({ target, panelId }) => {
-    // Force panelId to be a proper integer, default to 1
     const pid = parseInt(panelId) === 2 ? 2 : 1;
-    const val = parseFloat(target);
-    console.log(`[AUTO] autocashout:set socketId=${socket.id} panelId=${pid} target=${target} val=${val} gameState=${gameState.state}`);
-    if (!isNaN(val) && val >= 1.01) {
-      storePendingTarget(socket.id, pid, val);
-      if (gameState.state === "flying") {
-        scheduleTimer(socket.id, pid, val);
-      }
+    const val = target !== null && target !== undefined ? parseFloat(target) : null;
+    console.log(`[AUTO] autocashout:set socketId=${socket.id} panelId=${pid} target=${val}`);
+    if (val !== null && !isNaN(val) && val >= 1.01) {
+      setAutoCashoutTarget(socket.id, pid, val);
     } else {
-      storePendingTarget(socket.id, pid, null);
-      cancelTimer(socket.id, pid);
+      setAutoCashoutTarget(socket.id, pid, null);
     }
   });
 
@@ -616,7 +566,6 @@ io.on("connection", (socket) => {
         [socketUserId, "bet", `Bet Round #${gameState.roundId}`, -amount]
       );
 
-      // panel 1 key = socketId, panel 2 key = socketId_2
       const betKey = pid === 2 ? `${socket.id}_2` : socket.id;
       activeBets.set(betKey, {
         userId: socketUserId,
@@ -654,7 +603,8 @@ io.on("connection", (socket) => {
     if (!bet || bet.cashedOut)
       return socket.emit("cashout:result", { ok: false, error: "Cannot cash out now", panelId: pid });
 
-    cancelTimer(socket.id, pid);
+    // Clear auto-cashout target so tick loop doesn't fire again
+    setAutoCashoutTarget(socket.id, pid, null);
 
     const result = await performCashout(bet, mult);
     if (result) {
@@ -677,10 +627,7 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     console.log(`[SOCKET] disconnected socketId=${socket.id}`);
     socketUsers.delete(socket.id);
-    cancelTimer(socket.id, 1);
-    cancelTimer(socket.id, 2);
-    pendingAutoCashouts.delete(socket.id);
-    scheduledTimers.delete(socket.id);
+    autoCashoutTargets.delete(socket.id);
   });
 });
 
