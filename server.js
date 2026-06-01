@@ -1,6 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const http = require("http");
+const crypto = require("crypto");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
@@ -14,6 +15,8 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
+app.use("/api/wallet/paystack/webhook", express.raw({ type: "application/json" }));
+
 app.use(cors());
 app.use(express.json());
 
@@ -24,6 +27,13 @@ const pool = new Pool({
 
 const JWT_SECRET = process.env.JWT_SECRET || "avipesa_secret";
 
+// ─── IN-MEMORY STATE ──────────────────────────────────────────────────────────
+const activeBets = new Map();
+const socketUsers = new Map();
+const autoCashoutTargets = new Map();
+const balanceCache = new Map();
+
+// ─── JWT HELPERS ──────────────────────────────────────────────────────────────
 function signToken(userId) {
   return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "30d" });
 }
@@ -50,6 +60,7 @@ function formatUser(u) {
   };
 }
 
+// ─── DB INIT ──────────────────────────────────────────────────────────────────
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
@@ -58,6 +69,7 @@ async function initDB() {
       last_name TEXT NOT NULL,
       phone TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
+      email TEXT,
       balance NUMERIC(12,2) DEFAULT 0,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
@@ -67,11 +79,15 @@ async function initDB() {
       type TEXT NOT NULL,
       label TEXT NOT NULL,
       amount NUMERIC(12,2) NOT NULL,
+      reference TEXT UNIQUE,
+      status TEXT DEFAULT 'success',
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS game_rounds (
       id SERIAL PRIMARY KEY,
       crash_point NUMERIC(8,2) NOT NULL,
+      server_seed TEXT,
+      server_seed_hash TEXT,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS game_bets (
@@ -85,11 +101,275 @@ async function initDB() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+
+  await pool.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reference TEXT;
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'success';
+    ALTER TABLE game_rounds ADD COLUMN IF NOT EXISTS server_seed TEXT;
+    ALTER TABLE game_rounds ADD COLUMN IF NOT EXISTS server_seed_hash TEXT;
+  `);
+
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'transactions_reference_key'
+      ) THEN
+        ALTER TABLE transactions ADD CONSTRAINT transactions_reference_key UNIQUE (reference);
+      END IF;
+    END$$;
+  `);
+
   console.log("DB ready");
 }
 
-// AUTH ROUTES
+// ─── PROVABLY FAIR HELPERS ────────────────────────────────────────────────────
+function generateServerSeed() {
+  return crypto.randomBytes(32).toString("hex");
+}
 
+function hashServerSeed(seed) {
+  return crypto.createHash("sha256").update(seed).digest("hex");
+}
+
+function crashPointFromSeed(seed) {
+  const hmac = crypto.createHmac("sha256", seed).update("aviator").digest("hex");
+  const h = parseInt(hmac.slice(0, 8), 16);
+  const e = Math.pow(2, 32);
+  const raw = (100 * e - h) / (e - h);
+  const result = Math.max(1.0, raw / 100);
+  return parseFloat(result.toFixed(2));
+}
+
+// ─── PAYSTACK M-PESA DEPOSIT ──────────────────────────────────────────────────
+app.post("/api/wallet/paystack/initiate", authMiddleware, async (req, res) => {
+  const { amount, phone } = req.body;
+
+  if (!amount || amount < 10)
+    return res.status(400).json({ error: "Minimum deposit is KES 10" });
+  if (!phone)
+    return res.status(400).json({ error: "Phone number is required" });
+
+  try {
+    const userResult = await pool.query("SELECT * FROM users WHERE id=$1", [req.userId]);
+    const user = userResult.rows[0];
+
+    const amountInCents = Math.round(amount * 100);
+
+    let normalizedPhone = phone.toString().trim();
+    if (normalizedPhone.startsWith("0")) {
+      normalizedPhone = "+254" + normalizedPhone.slice(1);
+    } else if (normalizedPhone.startsWith("254")) {
+      normalizedPhone = "+" + normalizedPhone;
+    } else if (!normalizedPhone.startsWith("+")) {
+      normalizedPhone = "+254" + normalizedPhone;
+    }
+
+    const reference = `avipesa_${req.userId}_${Date.now()}`;
+
+    const payload = {
+      email: user.email || `${user.phone}@avipesa.com`,
+      amount: amountInCents,
+      currency: "KES",
+      mobile_money: {
+        phone: normalizedPhone,
+        provider: "mpesa",
+      },
+      reference,
+      metadata: {
+        userId: req.userId,
+        depositAmount: amount,
+      },
+    };
+
+    const response = await fetch("https://api.paystack.co/charge", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json();
+    console.log("[PAYSTACK] initiate response:", JSON.stringify(data));
+
+    if (!data.status) {
+      return res.status(400).json({ error: data.message || "Payment initiation failed" });
+    }
+
+    await pool.query(
+      `INSERT INTO transactions (user_id, type, label, amount, reference, status)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (reference) DO NOTHING`,
+      [req.userId, "dep", "M-Pesa Deposit", amount, reference, "pending"]
+    );
+
+    res.json({
+      ok: true,
+      reference,
+      status: data.data?.status,
+      message: "STK push sent — check your phone and enter your M-Pesa PIN",
+    });
+  } catch (err) {
+    console.error("[PAYSTACK] initiate error:", err);
+    res.status(500).json({ error: "Payment initiation failed" });
+  }
+});
+
+app.get("/api/wallet/paystack/verify/:reference", authMiddleware, async (req, res) => {
+  const { reference } = req.params;
+
+  try {
+    const response = await fetch(
+      `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
+        },
+      }
+    );
+
+    const data = await response.json();
+    console.log("[PAYSTACK] verify response:", data.data?.status);
+
+    if (!data.status) {
+      return res.status(400).json({ error: data.message || "Verification failed" });
+    }
+
+    const txStatus = data.data?.status;
+
+    if (txStatus === "success") {
+      const existing = await pool.query(
+        "SELECT * FROM transactions WHERE reference=$1 AND status='success'",
+        [reference]
+      );
+      if (existing.rows.length) {
+        const userResult = await pool.query(
+          "SELECT balance FROM users WHERE id=$1",
+          [req.userId]
+        );
+        return res.json({
+          ok: true,
+          status: "success",
+          balance: parseFloat(userResult.rows[0].balance),
+          alreadyCredited: true,
+        });
+      }
+
+      const meta = data.data?.metadata;
+      const depositAmount = meta?.depositAmount || data.data?.amount / 100;
+
+      const updated = await pool.query(
+        "UPDATE users SET balance=balance+$1 WHERE id=$2 RETURNING balance",
+        [depositAmount, req.userId]
+      );
+      const newBalance = parseFloat(updated.rows[0].balance);
+      balanceCache.set(req.userId, newBalance);
+
+      await pool.query(
+        "UPDATE transactions SET status='success' WHERE reference=$1",
+        [reference]
+      );
+
+      console.log(
+        `[PAYSTACK] credited userId=${req.userId} amount=${depositAmount} newBalance=${newBalance}`
+      );
+      return res.json({
+        ok: true,
+        status: "success",
+        balance: newBalance,
+        amount: depositAmount,
+      });
+    }
+
+    return res.json({ ok: true, status: txStatus });
+  } catch (err) {
+    console.error("[PAYSTACK] verify error:", err);
+    res.status(500).json({ error: "Verification failed" });
+  }
+});
+
+app.post("/api/wallet/paystack/webhook", async (req, res) => {
+  const signature = req.headers["x-paystack-signature"];
+  const hash = crypto
+    .createHmac("sha512", process.env.PAYSTACK_SECRET_KEY)
+    .update(req.body)
+    .digest("hex");
+
+  if (hash !== signature) {
+    console.warn("[WEBHOOK] invalid signature");
+    return res.status(401).send("Invalid signature");
+  }
+
+  let event;
+  try {
+    event = JSON.parse(req.body);
+  } catch {
+    return res.status(400).send("Bad JSON");
+  }
+
+  console.log("[WEBHOOK] event:", event.event, event.data?.reference);
+
+  if (event.event === "charge.success") {
+    const { reference, metadata, amount } = event.data;
+    const userId = metadata?.userId;
+    const depositAmount = metadata?.depositAmount || amount / 100;
+
+    if (!userId) return res.sendStatus(200);
+
+    try {
+      const existing = await pool.query(
+        "SELECT id FROM transactions WHERE reference=$1 AND status='success'",
+        [reference]
+      );
+      if (existing.rows.length) return res.sendStatus(200);
+
+      const updated = await pool.query(
+        "UPDATE users SET balance=balance+$1 WHERE id=$2 RETURNING balance",
+        [depositAmount, userId]
+      );
+      const newBalance = parseFloat(updated.rows[0].balance);
+      balanceCache.set(parseInt(userId), newBalance);
+
+      await pool.query(
+        "UPDATE transactions SET status='success' WHERE reference=$1",
+        [reference]
+      );
+
+      console.log(`[WEBHOOK] credited userId=${userId} amount=${depositAmount}`);
+    } catch (err) {
+      console.error("[WEBHOOK] error:", err);
+    }
+  }
+
+  res.sendStatus(200);
+});
+
+// ─── PROVABLY FAIR VERIFY ROUTE ───────────────────────────────────────────────
+app.get("/api/game/verify/:roundId", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, crash_point, server_seed, server_seed_hash FROM game_rounds WHERE id=$1",
+      [req.params.roundId]
+    );
+    if (!result.rows.length)
+      return res.status(404).json({ error: "Round not found" });
+    const row = result.rows[0];
+    res.json({
+      roundId: row.id,
+      crashPoint: parseFloat(row.crash_point),
+      serverSeed: row.server_seed,
+      serverSeedHash: row.server_seed_hash,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch round" });
+  }
+});
+
+// ─── AUTH ROUTES ──────────────────────────────────────────────────────────────
 app.post("/api/auth/register", async (req, res) => {
   const { firstName, lastName, phone, password } = req.body;
   if (!firstName || !lastName || !phone || !password)
@@ -145,8 +425,7 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
   }
 });
 
-// WALLET ROUTES
-
+// ─── WALLET ROUTES ────────────────────────────────────────────────────────────
 app.post("/api/wallet/deposit", authMiddleware, async (req, res) => {
   const { amount } = req.body;
   if (!amount || amount < 10)
@@ -173,7 +452,10 @@ app.post("/api/wallet/withdraw", authMiddleware, async (req, res) => {
   if (!amount || amount < 100)
     return res.status(400).json({ error: "Minimum withdrawal is KES 100" });
   try {
-    const userResult = await pool.query("SELECT balance FROM users WHERE id=$1", [req.userId]);
+    const userResult = await pool.query(
+      "SELECT balance FROM users WHERE id=$1",
+      [req.userId]
+    );
     const currentBalance = parseFloat(userResult.rows[0].balance);
     if (amount > currentBalance)
       return res.status(400).json({ error: "Insufficient balance" });
@@ -205,8 +487,7 @@ app.get("/api/wallet/transactions", authMiddleware, async (req, res) => {
   }
 });
 
-// GAME ROUTES
-
+// ─── GAME ROUTES ──────────────────────────────────────────────────────────────
 app.get("/api/game/leaderboard", async (req, res) => {
   try {
     const result = await pool.query(`
@@ -257,17 +538,11 @@ app.get("/api/game/stats", authMiddleware, async (req, res) => {
   }
 });
 
-// GAME ENGINE
-
-const BOT_NAMES = ["KipC***","WanjiM***","OmonB***","Amina***","JohnK***","FatumA***","MwanM***","AchiB***","BrianO***","GraceN***"];
-
-function generateCrashPoint() {
-  const r = Math.random();
-  if (r < 0.38) return +(1 + Math.random() * 0.8).toFixed(2);
-  if (r < 0.68) return +(1.8 + Math.random() * 2.5).toFixed(2);
-  if (r < 0.88) return +(4 + Math.random() * 8).toFixed(2);
-  return +(12 + Math.random() * 25).toFixed(2);
-}
+// ─── GAME ENGINE ──────────────────────────────────────────────────────────────
+const BOT_NAMES = [
+  "KipC***","WanjiM***","OmonB***","Amina***","JohnK***",
+  "FatumA***","MwanM***","AchiB***","BrianO***","GraceN***"
+];
 
 function getLiveMultiplier() {
   if (!gameState.startTime) return 1;
@@ -284,16 +559,9 @@ let gameState = {
   history: [],
   bets: [],
   startTime: null,
+  serverSeed: null,
+  serverSeedHash: null,
 };
-
-const activeBets = new Map();
-const socketUsers = new Map();
-
-// socketId -> Map(panelId -> target)
-const autoCashoutTargets = new Map();
-
-// In-memory balance cache to avoid DB round-trip on cashout response
-const balanceCache = new Map(); // userId -> balance
 
 function setAutoCashoutTarget(socketId, panelId, target) {
   if (!autoCashoutTargets.has(socketId)) {
@@ -342,7 +610,6 @@ function spawnBots() {
   }
 }
 
-// Performs DB writes in background — does NOT block the response
 function persistCashout(userId, roundId, mult, payout, profit) {
   pool.query(
     "UPDATE users SET balance=balance+$1 WHERE id=$2",
@@ -362,26 +629,22 @@ function persistCashout(userId, roundId, mult, payout, profit) {
   });
 }
 
-// Instant in-memory cashout — responds immediately, writes DB in background
 function performCashout(bet, mult) {
   if (bet.cashedOut) {
     console.log(`[CASHOUT] already cashed out — skipping`);
     return null;
   }
 
-  // Lock immediately to prevent any race (auto-tick vs manual)
   bet.cashedOut = true;
   bet.cashMult = mult;
 
   const payout = parseFloat((bet.amount * mult).toFixed(2));
   const profit = parseFloat((payout - bet.amount).toFixed(2));
 
-  // Update in-memory balance cache instantly
   const cachedBal = balanceCache.get(bet.userId) || 0;
   const newBalance = parseFloat((cachedBal + payout).toFixed(2));
   balanceCache.set(bet.userId, newBalance);
 
-  // Fire-and-forget DB writes — don't await
   persistCashout(bet.userId, gameState.roundId, mult, payout, profit);
 
   console.log(`[CASHOUT] instant userId=${bet.userId} mult=${mult} payout=${payout} newBalance=${newBalance}`);
@@ -396,28 +659,45 @@ async function startWaiting() {
   gameState.countdown = 5;
   gameState.bets = [];
   gameState.startTime = null;
+  gameState.serverSeed = null;
+  gameState.serverSeedHash = null;
 
   try {
-    const cp = generateCrashPoint();
+    const serverSeed = generateServerSeed();
+    const serverSeedHash = hashServerSeed(serverSeed);
+    const cp = crashPointFromSeed(serverSeed);
+
     const r = await pool.query(
-      "INSERT INTO game_rounds (crash_point) VALUES($1) RETURNING id",
-      [cp]
+      "INSERT INTO game_rounds (crash_point, server_seed, server_seed_hash) VALUES($1,$2,$3) RETURNING id",
+      [cp, serverSeed, serverSeedHash]
     );
+
     gameState.roundId = r.rows[0].id;
     gameState.crashPoint = cp;
-    console.log(`[GAME] waiting roundId=${gameState.roundId} crashPoint=${cp}`);
-  } catch {
+    gameState.serverSeed = serverSeed;
+    gameState.serverSeedHash = serverSeedHash;
+
+    console.log(
+      `[GAME] waiting roundId=${gameState.roundId} crashPoint=${cp} hash=${serverSeedHash.slice(0, 16)}...`
+    );
+  } catch (err) {
+    console.error("[GAME] round init error:", err);
+    const serverSeed = generateServerSeed();
+    gameState.serverSeed = serverSeed;
+    gameState.serverSeedHash = hashServerSeed(serverSeed);
     gameState.roundId = Date.now();
-    gameState.crashPoint = generateCrashPoint();
+    gameState.crashPoint = crashPointFromSeed(serverSeed);
   }
 
   spawnBots();
   gameState.bets = getBetsArray();
+
   io.emit("game:waiting", {
     state: "waiting",
     countdown: gameState.countdown,
     history: gameState.history,
     bets: gameState.bets,
+    nextHash: gameState.serverSeedHash,
   });
 
   let c = 5;
@@ -436,7 +716,9 @@ function startFlight() {
   gameState.state = "flying";
   gameState.startTime = Date.now();
   gameState.bets = getBetsArray();
-  console.log(`[GAME] flying startTime=${gameState.startTime} crashPoint=${gameState.crashPoint}`);
+  console.log(
+    `[GAME] flying startTime=${gameState.startTime} crashPoint=${gameState.crashPoint}`
+  );
 
   io.emit("game:flying", {
     state: "flying",
@@ -444,7 +726,6 @@ function startFlight() {
     bets: gameState.bets,
   });
 
-  // Schedule bot cashouts
   activeBets.forEach((bet) => {
     if (!bet.isBot || !bet.autoCashout) return;
     const tSeconds = Math.log(bet.autoCashout) / 0.35;
@@ -460,7 +741,6 @@ function startFlight() {
     const m = getLiveMultiplier();
     gameState.multiplier = m;
 
-    // Check auto-cashouts for real users on every tick
     for (const [betKey, bet] of activeBets) {
       if (bet.isBot || bet.cashedOut) continue;
 
@@ -468,7 +748,7 @@ function startFlight() {
       if (target !== null && m >= target) {
         console.log(`[AUTO] triggering betKey=${betKey} target=${target} m=${m}`);
         const cashMult = parseFloat(target.toFixed(2));
-        const result = performCashout(bet, cashMult); // now synchronous
+        const result = performCashout(bet, cashMult);
         if (result) {
           gameState.bets = getBetsArray();
           io.emit("game:bets", gameState.bets);
@@ -504,19 +784,27 @@ async function endRound(finalMult) {
   gameState.state = "crashed";
   gameState.history = [finalMult, ...gameState.history].slice(0, 12);
   gameState.bets = getBetsArray();
-  console.log(`[GAME] crashed finalMult=${finalMult}`);
+  console.log(
+    `[GAME] crashed finalMult=${finalMult} seed=${gameState.serverSeed?.slice(0, 16)}...`
+  );
+
   io.emit("game:crashed", {
     multiplier: finalMult,
     roundId: gameState.roundId,
     bets: gameState.bets,
+    hash: gameState.serverSeedHash,
+    seed: gameState.serverSeed,
   });
+
   activeBets.clear();
   setTimeout(startWaiting, 4000);
 }
 
+// ─── SOCKET.IO ────────────────────────────────────────────────────────────────
 io.on("connection", (socket) => {
   const token = socket.handshake.auth?.token;
   let socketUserId = null;
+
   if (token) {
     try {
       const decoded = jwt.verify(token, JWT_SECRET);
@@ -524,7 +812,6 @@ io.on("connection", (socket) => {
       socketUsers.set(socket.id, socketUserId);
       console.log(`[SOCKET] connected userId=${socketUserId} socketId=${socket.id}`);
 
-      // Load balance into cache
       pool.query("SELECT balance FROM users WHERE id=$1", [socketUserId])
         .then(r => {
           if (r.rows.length) balanceCache.set(socketUserId, parseFloat(r.rows[0].balance));
@@ -541,6 +828,7 @@ io.on("connection", (socket) => {
     countdown: gameState.countdown,
     history: gameState.history,
     bets: gameState.bets,
+    nextHash: gameState.serverSeedHash,
   });
 
   socket.on("autocashout:set", ({ target, panelId }) => {
@@ -556,7 +844,9 @@ io.on("connection", (socket) => {
 
   socket.on("bet:place", async ({ amount, panelId }) => {
     const pid = parseInt(panelId) === 2 ? 2 : 1;
-    console.log(`[BET] bet:place socketId=${socket.id} userId=${socketUserId} amount=${amount} panelId=${pid}`);
+    console.log(
+      `[BET] bet:place socketId=${socket.id} userId=${socketUserId} amount=${amount} panelId=${pid}`
+    );
     if (gameState.state !== "waiting")
       return socket.emit("bet:result", { ok: false, error: "Betting is closed", panelId: pid });
     if (!socketUserId)
@@ -568,13 +858,12 @@ io.on("connection", (socket) => {
       const user = userResult.rows[0];
       if (!user || parseFloat(user.balance) < amount)
         return socket.emit("bet:result", { ok: false, error: "Insufficient balance", panelId: pid });
+
       const updated = await pool.query(
         "UPDATE users SET balance=balance-$1 WHERE id=$2 RETURNING balance",
         [amount, socketUserId]
       );
       const newBalance = parseFloat(updated.rows[0].balance);
-
-      // Keep cache in sync after bet deduction
       balanceCache.set(socketUserId, newBalance);
 
       await pool.query(
@@ -610,9 +899,10 @@ io.on("connection", (socket) => {
 
   socket.on("bet:cashout", ({ panelId } = {}) => {
     const pid = parseInt(panelId) === 2 ? 2 : 1;
-    // Capture multiplier the instant the event arrives — before any await
     const mult = parseFloat(getLiveMultiplier().toFixed(2));
-    console.log(`[CASHOUT] bet:cashout socketId=${socket.id} panelId=${pid} liveMult=${mult} gameState=${gameState.state}`);
+    console.log(
+      `[CASHOUT] bet:cashout socketId=${socket.id} panelId=${pid} liveMult=${mult} gameState=${gameState.state}`
+    );
 
     if (gameState.state !== "flying")
       return socket.emit("cashout:result", { ok: false, error: "Cannot cash out now", panelId: pid });
@@ -624,10 +914,8 @@ io.on("connection", (socket) => {
     if (!bet || bet.cashedOut)
       return socket.emit("cashout:result", { ok: false, error: "Cannot cash out now", panelId: pid });
 
-    // Clear auto-cashout so tick loop won't fire after this
     setAutoCashoutTarget(socket.id, pid, null);
 
-    // Synchronous — responds instantly, DB writes happen in background
     const result = performCashout(bet, mult);
     if (result) {
       gameState.bets = getBetsArray();
@@ -653,6 +941,7 @@ io.on("connection", (socket) => {
   });
 });
 
+// ─── START ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 initDB()
   .then(() => {
