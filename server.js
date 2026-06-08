@@ -952,3 +952,222 @@ initDB()
     console.error("DB init failed:", err);
     process.exit(1);
   });
+// ─── ADMIN MIDDLEWARE ─────────────────────────────────────────────────────────
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "avipesa_admin_2024";
+
+function adminAuth(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith("Bearer "))
+    return res.status(401).json({ error: "Unauthorized" });
+  const token = header.split(" ")[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded.isAdmin) return res.status(403).json({ error: "Forbidden" });
+    req.adminId = decoded.adminId;
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid or expired admin token" });
+  }
+}
+
+// ─── ADMIN LOGIN ──────────────────────────────────────────────────────────────
+app.post("/api/admin/login", (req, res) => {
+  const { secret } = req.body;
+  if (!secret || secret !== ADMIN_SECRET)
+    return res.status(401).json({ error: "Invalid admin secret" });
+  const token = jwt.sign({ isAdmin: true, adminId: "admin" }, JWT_SECRET, { expiresIn: "12h" });
+  res.json({ token });
+});
+
+// ─── ADMIN: FINANCIAL OVERVIEW ────────────────────────────────────────────────
+app.get("/api/admin/overview", adminAuth, async (req, res) => {
+  try {
+    const [deps, wds, bets, wins, users, rounds] = await Promise.all([
+      pool.query(`SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE type='dep' AND status='success'`),
+      pool.query(`SELECT COALESCE(SUM(ABS(amount)),0) AS total FROM transactions WHERE type='wd'`),
+      pool.query(`SELECT COALESCE(SUM(ABS(amount)),0) AS total FROM transactions WHERE type='bet'`),
+      pool.query(`SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE type='win'`),
+      pool.query(`SELECT COUNT(*) AS total FROM users`),
+      pool.query(`SELECT COUNT(*) AS total FROM game_rounds`),
+    ]);
+    const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+    const [depsToday, newUsers] = await Promise.all([
+      pool.query(`SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE type='dep' AND status='success' AND created_at >= $1`, [todayStart]),
+      pool.query(`SELECT COUNT(*) AS total FROM users WHERE created_at >= $1`, [todayStart]),
+    ]);
+    const totalBets   = parseFloat(bets.rows[0].total);
+    const totalWins   = parseFloat(wins.rows[0].total);
+    const houseProfit = parseFloat((totalBets - totalWins).toFixed(2));
+    res.json({
+      totalDeposits:   parseFloat(deps.rows[0].total),
+      totalWithdrawals: parseFloat(wds.rows[0].total),
+      totalBetsPlaced: totalBets,
+      totalWinsPaid:   totalWins,
+      houseProfit,
+      totalUsers:      parseInt(users.rows[0].total),
+      totalRounds:     parseInt(rounds.rows[0].total),
+      depositsToday:   parseFloat(depsToday.rows[0].total),
+      newUsersToday:   parseInt(newUsers.rows[0].total),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch overview" });
+  }
+});
+
+// ─── ADMIN: USER LIST ─────────────────────────────────────────────────────────
+app.get("/api/admin/users", adminAuth, async (req, res) => {
+  const { search = "", page = 1, limit = 30 } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  try {
+    const q = `%${search}%`;
+    const result = await pool.query(`
+      SELECT u.id, u.first_name, u.last_name, u.phone, u.balance, u.created_at, u.banned,
+        COUNT(gb.id) AS total_bets,
+        COALESCE(SUM(CASE WHEN gb.cashed_out THEN gb.payout - gb.amount ELSE 0 END),0) AS total_won
+      FROM users u
+      LEFT JOIN game_bets gb ON gb.user_id = u.id
+      WHERE u.phone ILIKE $1 OR u.first_name ILIKE $1 OR u.last_name ILIKE $1
+      GROUP BY u.id
+      ORDER BY u.created_at DESC
+      LIMIT $2 OFFSET $3
+    `, [q, parseInt(limit), offset]);
+    const count = await pool.query(`SELECT COUNT(*) FROM users WHERE phone ILIKE $1 OR first_name ILIKE $1 OR last_name ILIKE $1`, [q]);
+    res.json({ users: result.rows, total: parseInt(count.rows[0].count) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch users" });
+  }
+});
+
+// ─── ADMIN: USER DETAIL ───────────────────────────────────────────────────────
+app.get("/api/admin/users/:id", adminAuth, async (req, res) => {
+  try {
+    const user = await pool.query("SELECT id,first_name,last_name,phone,balance,created_at,banned FROM users WHERE id=$1", [req.params.id]);
+    if (!user.rows.length) return res.status(404).json({ error: "User not found" });
+    const txns = await pool.query("SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50", [req.params.id]);
+    const bets = await pool.query("SELECT gb.*,gr.crash_point FROM game_bets gb LEFT JOIN game_rounds gr ON gr.id=gb.round_id WHERE gb.user_id=$1 ORDER BY gb.created_at DESC LIMIT 50", [req.params.id]);
+    res.json({ user: user.rows[0], transactions: txns.rows, bets: bets.rows });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch user detail" });
+  }
+});
+
+// ─── ADMIN: ADJUST BALANCE ────────────────────────────────────────────────────
+app.post("/api/admin/users/:id/balance", adminAuth, async (req, res) => {
+  const { amount, note } = req.body;
+  if (!amount || isNaN(parseFloat(amount)))
+    return res.status(400).json({ error: "Invalid amount" });
+  try {
+    const updated = await pool.query(
+      "UPDATE users SET balance=balance+$1 WHERE id=$2 RETURNING balance",
+      [parseFloat(amount), req.params.id]
+    );
+    if (!updated.rows.length) return res.status(404).json({ error: "User not found" });
+    await pool.query(
+      "INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)",
+      [req.params.id, amount > 0 ? "dep" : "wd", note || "Admin adjustment", parseFloat(amount)]
+    );
+    res.json({ ok: true, balance: parseFloat(updated.rows[0].balance) });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to adjust balance" });
+  }
+});
+
+// ─── ADMIN: BAN / UNBAN USER ──────────────────────────────────────────────────
+app.post("/api/admin/users/:id/ban", adminAuth, async (req, res) => {
+  const { banned } = req.body;
+  try {
+    await pool.query("UPDATE users SET banned=$1 WHERE id=$2", [!!banned, req.params.id]);
+    res.json({ ok: true, banned: !!banned });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to update ban status" });
+  }
+});
+
+// ─── ADMIN: ALL TRANSACTIONS ──────────────────────────────────────────────────
+app.get("/api/admin/transactions", adminAuth, async (req, res) => {
+  const { type = "", page = 1, limit = 50 } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  try {
+    const filter = type ? `AND t.type = '${type}'` : "";
+    const result = await pool.query(`
+      SELECT t.*, u.first_name, u.last_name, u.phone
+      FROM transactions t
+      LEFT JOIN users u ON u.id = t.user_id
+      WHERE 1=1 ${filter}
+      ORDER BY t.created_at DESC
+      LIMIT $1 OFFSET $2
+    `, [parseInt(limit), offset]);
+    const count = await pool.query(`SELECT COUNT(*) FROM transactions WHERE 1=1 ${filter}`);
+    res.json({ transactions: result.rows, total: parseInt(count.rows[0].count) });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch transactions" });
+  }
+});
+
+// ─── ADMIN: GAME ROUNDS HISTORY ───────────────────────────────────────────────
+app.get("/api/admin/rounds", adminAuth, async (req, res) => {
+  const { page = 1, limit = 50 } = req.query;
+  const offset = (parseInt(page) - 1) * parseInt(limit);
+  try {
+    const result = await pool.query(`
+      SELECT gr.*, COUNT(gb.id) AS bet_count,
+        COALESCE(SUM(gb.amount),0) AS total_wagered,
+        COALESCE(SUM(CASE WHEN gb.cashed_out THEN gb.payout ELSE 0 END),0) AS total_paid
+      FROM game_rounds gr
+      LEFT JOIN game_bets gb ON gb.round_id = gr.id
+      GROUP BY gr.id
+      ORDER BY gr.created_at DESC
+      LIMIT $1 OFFSET $2
+    `, [parseInt(limit), offset]);
+    const count = await pool.query("SELECT COUNT(*) FROM game_rounds");
+    res.json({ rounds: result.rows, total: parseInt(count.rows[0].count) });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch rounds" });
+  }
+});
+
+// ─── ADMIN: LIVE GAME STATE ───────────────────────────────────────────────────
+app.get("/api/admin/live", adminAuth, (req, res) => {
+  res.json({
+    state:      gameState.state,
+    multiplier: gameState.multiplier,
+    crashPoint: gameState.crashPoint,
+    roundId:    gameState.roundId,
+    countdown:  gameState.countdown,
+    activeBets: [...activeBets.values()].map(b => ({
+      name:      b.name,
+      amount:    b.amount,
+      cashedOut: b.cashedOut,
+      cashMult:  b.cashMult,
+      isBot:     b.isBot,
+    })),
+    history: gameState.history,
+  });
+});
+
+// ─── ADMIN: GAME STATS OVERVIEW ───────────────────────────────────────────────
+app.get("/api/admin/gamestats", adminAuth, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        COUNT(*) AS total_rounds,
+        AVG(crash_point) AS avg_crash,
+        MAX(crash_point) AS max_crash,
+        MIN(crash_point) AS min_crash,
+        COUNT(CASE WHEN crash_point < 2 THEN 1 END) AS under_2x,
+        COUNT(CASE WHEN crash_point >= 2 AND crash_point < 5 THEN 1 END) AS btw_2_5x,
+        COUNT(CASE WHEN crash_point >= 5 AND crash_point < 10 THEN 1 END) AS btw_5_10x,
+        COUNT(CASE WHEN crash_point >= 10 THEN 1 END) AS over_10x
+      FROM game_rounds
+    `);
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch game stats" });
+  }
+});
+
+// ─── ADMIN: ADD banned COLUMN IF MISSING ─────────────────────────────────────
+pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE`)
+  .catch(() => {});
