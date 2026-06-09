@@ -172,15 +172,17 @@ app.get("/api/wallet/paystack/verify/:reference", authMiddleware, async (req, re
     if (!data.status) return res.status(400).json({ error: data.message || "Verification failed" });
     const txStatus = data.data?.status;
     if (txStatus === "success") {
-      const existing = await pool.query("SELECT * FROM transactions WHERE reference=$1 AND status='success'", [req.params.reference]);
-      if (existing.rows.length) {
+      const depositAmount = data.data?.metadata?.depositAmount || data.data?.amount / 100;
+      const credited = await pool.query(
+        "UPDATE transactions SET status='success' WHERE reference=$1 AND status='pending' RETURNING id",
+        [req.params.reference]
+      );
+      if (credited.rows.length === 0) {
         const u = await pool.query("SELECT balance FROM users WHERE id=$1", [req.userId]);
         return res.json({ ok: true, status: "success", balance: parseFloat(u.rows[0].balance), alreadyCredited: true });
       }
-      const depositAmount = data.data?.metadata?.depositAmount || data.data?.amount / 100;
       const updated = await pool.query("UPDATE users SET balance=balance+$1 WHERE id=$2 RETURNING balance", [depositAmount, req.userId]);
       balanceCache.set(req.userId, parseFloat(updated.rows[0].balance));
-      await pool.query("UPDATE transactions SET status='success' WHERE reference=$1", [req.params.reference]);
       return res.json({ ok: true, status: "success", balance: parseFloat(updated.rows[0].balance), amount: depositAmount });
     }
     return res.json({ ok: true, status: txStatus });
@@ -242,15 +244,7 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
   } catch { res.status(500).json({ error: "Server error" }); }
 });
 
-app.post("/api/wallet/deposit", authMiddleware, async (req, res) => {
-  const { amount } = req.body;
-  if (!amount || amount < 10) return res.status(400).json({ error: "Minimum deposit is KES 10" });
-  try {
-    const result = await pool.query("UPDATE users SET balance=balance+$1 WHERE id=$2 RETURNING balance", [amount, req.userId]);
-    await pool.query("INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)", [req.userId, "dep", "M-Pesa Deposit", amount]);
-    res.json({ ok: true, balance: parseFloat(result.rows[0].balance) });
-  } catch { res.status(500).json({ error: "Deposit failed" }); }
-});
+// Direct deposit endpoint removed - use /api/wallet/paystack/initiate instead
 
 app.post("/api/wallet/withdraw", authMiddleware, async (req, res) => {
   const { amount } = req.body;
