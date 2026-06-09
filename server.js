@@ -221,7 +221,7 @@ app.post("/api/auth/register", async (req, res) => {
     const hash = await bcrypt.hash(password, 10);
     const result = await pool.query("INSERT INTO users (first_name,last_name,phone,password_hash) VALUES($1,$2,$3,$4) RETURNING *", [firstName.trim(), lastName.trim(), phone, hash]);
     res.json({ token: signToken(result.rows[0].id), user: formatUser(result.rows[0]) });
-  } catch { res.status(500).json({ error: "Registration failed" }); }
+  } catch(err) { console.error("[REGISTER]", err); res.status(500).json({ error: err.message || "Registration failed" }); }
 });
 
 app.post("/api/auth/login", async (req, res) => {
