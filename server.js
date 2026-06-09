@@ -27,6 +27,25 @@ const pool = new Pool({
 const JWT_SECRET = process.env.JWT_SECRET || "avipesa_secret";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "avipesa_admin_2024";
 
+function generateAviId() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let id = "AVI";
+  for (let i = 0; i < 4; i++) id += chars[Math.floor(Math.random() * chars.length)];
+  return id;
+}
+
+async function assignAviId(userId) {
+  let attempts = 0;
+  while (attempts < 20) {
+    const id = generateAviId();
+    try {
+      await pool.query("UPDATE users SET avi_id=$1 WHERE id=$2 AND avi_id IS NULL", [id, userId]);
+      return id;
+    } catch { attempts++; }
+  }
+  return null;
+}
+
 const activeBets = new Map();
 const socketUsers = new Map();
 const autoCashoutTargets = new Map();
@@ -70,7 +89,16 @@ function formatUser(u) {
     name: `${u.first_name} ${u.last_name}`,
     phone: u.phone,
     balance: parseFloat(u.balance),
+    aviId: u.avi_id || null,
   };
+}
+
+async function backfillAviIds() {
+  try {
+    const res = await pool.query("SELECT id FROM users WHERE avi_id IS NULL");
+    for (const row of res.rows) await assignAviId(row.id);
+    if (res.rows.length) console.log(`AVI IDs assigned to ${res.rows.length} users`);
+  } catch(e) { console.error("AVI ID backfill error:", e); }
 }
 
 async function initDB() {
@@ -83,6 +111,7 @@ async function initDB() {
       password_hash TEXT NOT NULL,
       email TEXT,
       balance NUMERIC(12,2) DEFAULT 0,
+      avi_id TEXT UNIQUE,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS transactions (
@@ -115,6 +144,7 @@ async function initDB() {
   `);
   await pool.query(`
     ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS avi_id TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reference TEXT;
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'success';
@@ -220,6 +250,9 @@ app.post("/api/auth/register", async (req, res) => {
     if (exists.rows.length) return res.status(409).json({ error: "Phone number already registered" });
     const hash = await bcrypt.hash(password, 10);
     const result = await pool.query("INSERT INTO users (first_name,last_name,phone,password_hash) VALUES($1,$2,$3,$4) RETURNING *", [firstName.trim(), lastName.trim(), phone, hash]);
+    await assignAviId(result.rows[0].id);
+    const finalUser = await pool.query("SELECT * FROM users WHERE id=$1", [result.rows[0].id]);
+    result.rows[0] = finalUser.rows[0];
     res.json({ token: signToken(result.rows[0].id), user: formatUser(result.rows[0]) });
   } catch(err) { console.error("[REGISTER]", err); res.status(500).json({ error: err.message || "Registration failed" }); }
 });
@@ -238,7 +271,7 @@ app.post("/api/auth/login", async (req, res) => {
 
 app.get("/api/auth/me", authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM users WHERE id=$1", [req.userId]);
+    const result = await pool.query("SELECT id,first_name,last_name,phone,balance,avi_id FROM users WHERE id=$1", [req.userId]);
     if (!result.rows.length) return res.status(401).json({ error: "User not found" });
     res.json({ user: formatUser(result.rows[0]) });
   } catch { res.status(500).json({ error: "Server error" }); }
@@ -407,7 +440,12 @@ app.get("/api/admin/gamestats", adminAuth, async (req, res) => {
   } catch { res.status(500).json({ error: "Failed to fetch game stats" }); }
 });
 
-const BOT_NAMES = ["KipC***","WanjiM***","OmonB***","Amina***","JohnK***","FatumA***","MwanM***","AchiB***","BrianO***","GraceN***"];
+const BOT_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+function randomAviId() {
+  let id = "AVI";
+  for (let i = 0; i < 4; i++) id += BOT_CHARS[Math.floor(Math.random() * BOT_CHARS.length)];
+  return id;
+}
 
 let gameState = { state:"waiting", multiplier:1, countdown:5, crashPoint:2, roundId:null, history:[], bets:[], startTime:null, serverSeed:null, serverSeedHash:null };
 
@@ -429,13 +467,29 @@ function getAutoCashoutTarget(socketId,panelId) {
 }
 
 function getBetsArray() {
-  return [...activeBets.values()].map(b=>({id:b.userId||b.socketId,name:b.name,bet:b.amount,cashed:b.cashedOut,cashMult:b.cashMult||null}));
+  const arr = [...activeBets.values()].map(b=>({id:b.userId||b.socketId,name:b.name,bet:b.amount,cashed:b.cashedOut,cashMult:b.cashMult||null}));
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
 }
 
 function spawnBots() {
-  const count = 3+Math.floor(Math.random()*6);
-  for (let i=0;i<count;i++) {
-    activeBets.set(`bot_${i}_${Date.now()}`,{userId:null,socketId:`bot_${i}`,name:BOT_NAMES[Math.floor(Math.random()*BOT_NAMES.length)],amount:[25,50,100,200,500][Math.floor(Math.random()*5)],cashedOut:false,cashMult:null,isBot:true,autoCashout:+(1.3+Math.random()*6).toFixed(2)});
+  const count = 300 + Math.floor(Math.random() * 501);
+  const betOptions = [10,25,50,100,200,500,1000,2000,5000];
+  for (let i = 0; i < count; i++) {
+    const key = `bot_${i}_${Date.now()}`;
+    activeBets.set(key, {
+      userId: null,
+      socketId: key,
+      name: randomAviId(),
+      amount: betOptions[Math.floor(Math.random() * betOptions.length)],
+      cashedOut: false,
+      cashMult: null,
+      isBot: true,
+      autoCashout: +(1.2 + Math.random() * 8).toFixed(2),
+    });
   }
 }
 
@@ -527,7 +581,7 @@ io.on("connection",(socket)=>{
     if(!socketUserId) return socket.emit("bet:result",{ok:false,error:"Please sign in to bet",panelId:pid});
     if(!amount||amount<10) return socket.emit("bet:result",{ok:false,error:"Minimum bet is KES 10",panelId:pid});
     try{
-      const u=await pool.query("SELECT * FROM users WHERE id=$1",[socketUserId]);
+      const u=await pool.query("SELECT id,first_name,last_name,balance,banned,avi_id FROM users WHERE id=$1",[socketUserId]);
       const user=u.rows[0];
       if(!user||parseFloat(user.balance)<amount) return socket.emit("bet:result",{ok:false,error:"Insufficient balance",panelId:pid});
       const updated=await pool.query("UPDATE users SET balance=balance-$1 WHERE id=$2 RETURNING balance",[amount,socketUserId]);
@@ -535,7 +589,8 @@ io.on("connection",(socket)=>{
       await pool.query("INSERT INTO game_bets (round_id,user_id,amount) VALUES($1,$2,$3)",[gameState.roundId,socketUserId,amount]);
       await pool.query("INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)",[socketUserId,"bet",`Bet Round #${gameState.roundId}`,-amount]);
       const betKey=pid===2?`${socket.id}_2`:socket.id;
-      activeBets.set(betKey,{userId:socketUserId,socketId:socket.id,betKey,panelId:pid,name:`${user.first_name} ${user.last_name[0]}***`,amount,cashedOut:false,cashMult:null,isBot:false});
+      const displayName = user.avi_id || randomAviId();
+      activeBets.set(betKey,{userId:socketUserId,socketId:socket.id,betKey,panelId:pid,name:displayName,amount,cashedOut:false,cashMult:null,isBot:false});
       gameState.bets=getBetsArray(); io.emit("game:bets",gameState.bets);
       socket.emit("bet:result",{ok:true,balance:newBalance,amount,panelId:pid});
     }catch{socket.emit("bet:result",{ok:false,error:"Bet failed",panelId:pid});}
@@ -721,5 +776,5 @@ app.post("/api/admin/broadcast", adminAuth, async (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 initDB()
-  .then(()=>{startWaiting();server.listen(PORT,()=>console.log(`Server running on port ${PORT}`));})
+  .then(()=>backfillAviIds()).then(()=>{startWaiting();server.listen(PORT,()=>console.log(`Server running on port ${PORT}`));})
   .catch(err=>{console.error("DB init failed:",err);process.exit(1);});
