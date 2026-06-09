@@ -260,7 +260,7 @@ app.post("/api/wallet/withdraw", authMiddleware, async (req, res) => {
 
 app.get("/api/wallet/transactions", authMiddleware, async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100", [req.userId]);
+    const result = await pool.query("SELECT id, type, label, amount, status, reference, created_at FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100", [req.userId]);
     res.json(result.rows);
   } catch { res.status(500).json({ error: "Failed to fetch transactions" }); }
 });
@@ -549,6 +549,169 @@ io.on("connection",(socket)=>{
     else socket.emit("cashout:result",{ok:false,error:"Cashout failed",panelId:pid});
   });
   socket.on("disconnect",()=>{socketUsers.delete(socket.id);autoCashoutTargets.delete(socket.id);});
+});
+
+
+// ── ADMIN REPORTS ─────────────────────────────────────────────────────────────
+app.get("/api/admin/reports/daily", adminAuth, async (req, res) => {
+  try {
+    const today = new Date(); today.setHours(0,0,0,0);
+    const yesterday = new Date(today); yesterday.setDate(yesterday.getDate()-1);
+    const [deps, wds, bets, wins, newUsers, activeUsers, rounds] = await Promise.all([
+      pool.query("SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS count FROM transactions WHERE type='dep' AND status='success' AND created_at>=\$1", [today]),
+      pool.query("SELECT COALESCE(SUM(ABS(amount)),0) AS total, COUNT(*) AS count FROM transactions WHERE type='wd' AND created_at>=\$1", [today]),
+      pool.query("SELECT COALESCE(SUM(ABS(amount)),0) AS total, COUNT(*) AS count FROM transactions WHERE type='bet' AND created_at>=\$1", [today]),
+      pool.query("SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS count FROM transactions WHERE type='win' AND created_at>=\$1", [today]),
+      pool.query("SELECT COUNT(*) AS count FROM users WHERE created_at>=\$1", [today]),
+      pool.query("SELECT COUNT(DISTINCT user_id) AS count FROM game_bets WHERE created_at>=\$1", [today]),
+      pool.query("SELECT COUNT(*) AS count FROM game_rounds WHERE created_at>=\$1", [today]),
+    ]);
+    const [ydeps, ywds, ybets, ywins] = await Promise.all([
+      pool.query("SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE type='dep' AND status='success' AND created_at>=\$1 AND created_at<\$2", [yesterday, today]),
+      pool.query("SELECT COALESCE(SUM(ABS(amount)),0) AS total FROM transactions WHERE type='wd' AND created_at>=\$1 AND created_at<\$2", [yesterday, today]),
+      pool.query("SELECT COALESCE(SUM(ABS(amount)),0) AS total FROM transactions WHERE type='bet' AND created_at>=\$1 AND created_at<\$2", [yesterday, today]),
+      pool.query("SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE type='win' AND created_at>=\$1 AND created_at<\$2", [yesterday, today]),
+    ]);
+    res.json({
+      today: {
+        deposits: parseFloat(deps.rows[0].total), depositCount: parseInt(deps.rows[0].count),
+        withdrawals: parseFloat(wds.rows[0].total), withdrawalCount: parseInt(wds.rows[0].count),
+        bets: parseFloat(bets.rows[0].total), betCount: parseInt(bets.rows[0].count),
+        wins: parseFloat(wins.rows[0].total),
+        profit: parseFloat(bets.rows[0].total) - parseFloat(wins.rows[0].total),
+        newUsers: parseInt(newUsers.rows[0].count),
+        activeUsers: parseInt(activeUsers.rows[0].count),
+        rounds: parseInt(rounds.rows[0].count),
+      },
+      yesterday: {
+        deposits: parseFloat(ydeps.rows[0].total),
+        withdrawals: parseFloat(ywds.rows[0].total),
+        bets: parseFloat(ybets.rows[0].total),
+        wins: parseFloat(ywins.rows[0].total),
+        profit: parseFloat(ybets.rows[0].total) - parseFloat(ywins.rows[0].total),
+      }
+    });
+  } catch(err) { console.error(err); res.status(500).json({ error: "Failed to fetch daily report" }); }
+});
+
+app.get("/api/admin/reports/revenue", adminAuth, async (req, res) => {
+  try {
+    const days = parseInt(req.query.days) || 7;
+    const rows = [];
+    for (let i = days-1; i >= 0; i--) {
+      const d = new Date(); d.setHours(0,0,0,0); d.setDate(d.getDate()-i);
+      const next = new Date(d); next.setDate(next.getDate()+1);
+      const [bets, wins, deps] = await Promise.all([
+        pool.query("SELECT COALESCE(SUM(ABS(amount)),0) AS total FROM transactions WHERE type='bet' AND created_at>=\$1 AND created_at<\$2", [d, next]),
+        pool.query("SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE type='win' AND created_at>=\$1 AND created_at<\$2", [d, next]),
+        pool.query("SELECT COALESCE(SUM(amount),0) AS total FROM transactions WHERE type='dep' AND status='success' AND created_at>=\$1 AND created_at<\$2", [d, next]),
+      ]);
+      rows.push({
+        date: d.toISOString().split('T')[0],
+        profit: parseFloat(bets.rows[0].total) - parseFloat(wins.rows[0].total),
+        deposits: parseFloat(deps.rows[0].total),
+        bets: parseFloat(bets.rows[0].total),
+      });
+    }
+    res.json(rows);
+  } catch(err) { res.status(500).json({ error: "Failed to fetch revenue" }); }
+});
+
+app.get("/api/admin/reports/topdepositors", adminAuth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT u.id, u.first_name, u.last_name, u.phone, COALESCE(SUM(t.amount),0) AS total_deposited, COUNT(t.id) AS deposit_count FROM users u LEFT JOIN transactions t ON t.user_id=u.id AND t.type='dep' AND t.status='success' GROUP BY u.id ORDER BY total_deposited DESC LIMIT 10");
+    res.json(r.rows);
+  } catch(err) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.get("/api/admin/reports/topwinners", adminAuth, async (req, res) => {
+  try {
+    const r = await pool.query("SELECT u.id, u.first_name, u.last_name, COALESCE(SUM(CASE WHEN gb.cashed_out THEN gb.payout-gb.amount ELSE 0 END),0) AS total_profit, COUNT(gb.id) AS total_bets, COALESCE(MAX(gb.cashout_mult),0) AS best_mult FROM users u LEFT JOIN game_bets gb ON gb.user_id=u.id GROUP BY u.id ORDER BY total_profit DESC LIMIT 10");
+    res.json(r.rows);
+  } catch(err) { res.status(500).json({ error: "Failed" }); }
+});
+
+// ── GAME CONTROLS ──────────────────────────────────────────────────────────────
+let gameConfig = { paused: false, minBet: 10, maxBet: 50000, bannerMsg: "" };
+
+app.get("/api/admin/game/config", adminAuth, (req, res) => res.json(gameConfig));
+
+app.post("/api/admin/game/pause", adminAuth, (req, res) => {
+  gameConfig.paused = req.body.paused;
+  io.emit("game:config", gameConfig);
+  res.json({ ok: true, paused: gameConfig.paused });
+});
+
+app.post("/api/admin/game/limits", adminAuth, (req, res) => {
+  const { minBet, maxBet } = req.body;
+  if (minBet) gameConfig.minBet = parseFloat(minBet);
+  if (maxBet) gameConfig.maxBet = parseFloat(maxBet);
+  io.emit("game:config", gameConfig);
+  res.json({ ok: true, config: gameConfig });
+});
+
+app.post("/api/admin/game/banner", adminAuth, (req, res) => {
+  gameConfig.bannerMsg = req.body.message || "";
+  io.emit("game:config", gameConfig);
+  res.json({ ok: true, banner: gameConfig.bannerMsg });
+});
+
+// ── RISK MANAGEMENT ────────────────────────────────────────────────────────────
+app.get("/api/admin/risk/suspicious", adminAuth, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT u.id, u.first_name, u.last_name, u.phone,
+        COUNT(gb.id) AS total_bets,
+        COUNT(CASE WHEN gb.cashed_out THEN 1 END) AS wins,
+        ROUND(COUNT(CASE WHEN gb.cashed_out THEN 1 END)::numeric/NULLIF(COUNT(gb.id),0)*100,1) AS win_rate,
+        COALESCE(AVG(CASE WHEN gb.cashed_out THEN gb.cashout_mult END),0) AS avg_cashout,
+        COALESCE(MAX(gb.cashout_mult),0) AS max_cashout,
+        COALESCE(SUM(CASE WHEN gb.cashed_out THEN gb.payout-gb.amount ELSE 0 END),0) AS total_profit
+      FROM users u
+      LEFT JOIN game_bets gb ON gb.user_id=u.id
+      GROUP BY u.id
+      HAVING COUNT(gb.id) >= 10
+      ORDER BY win_rate DESC NULLS LAST
+      LIMIT 20
+    `);
+    res.json(r.rows);
+  } catch(err) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.get("/api/admin/risk/largewithdrawals", adminAuth, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT t.*, u.first_name, u.last_name, u.phone
+      FROM transactions t
+      LEFT JOIN users u ON u.id=t.user_id
+      WHERE t.type='wd' AND ABS(t.amount) >= 1000
+      ORDER BY t.created_at DESC LIMIT 50
+    `);
+    res.json(r.rows);
+  } catch(err) { res.status(500).json({ error: "Failed" }); }
+});
+
+// ── COMMUNICATIONS ─────────────────────────────────────────────────────────────
+app.post("/api/admin/notify/:userId", adminAuth, async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: "Message required" });
+  try {
+    const u = await pool.query("SELECT * FROM users WHERE id=\$1", [req.params.userId]);
+    if (!u.rows.length) return res.status(404).json({ error: "User not found" });
+    const sockets = [...socketUsers.entries()].filter(([,uid]) => uid === parseInt(req.params.userId));
+    sockets.forEach(([sid]) => {
+      const sock = io.sockets.sockets.get(sid);
+      if (sock) sock.emit("admin:notify", { message, time: new Date() });
+    });
+    res.json({ ok: true, delivered: sockets.length > 0, message });
+  } catch(err) { res.status(500).json({ error: "Failed" }); }
+});
+
+app.post("/api/admin/broadcast", adminAuth, async (req, res) => {
+  const { message } = req.body;
+  if (!message) return res.status(400).json({ error: "Message required" });
+  io.emit("admin:broadcast", { message, time: new Date() });
+  res.json({ ok: true, message });
 });
 
 const PORT = process.env.PORT || 3001;
