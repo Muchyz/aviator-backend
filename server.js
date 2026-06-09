@@ -458,6 +458,10 @@ function performCashout(bet,mult) {
 }
 
 async function startWaiting() {
+  if (gameConfig.paused) {
+    setTimeout(startWaiting, 2000);
+    return;
+  }
   activeBets.clear();
   gameState={...gameState,state:"waiting",multiplier:1,countdown:5,bets:[],startTime:null};
   try {
@@ -635,6 +639,7 @@ app.get("/api/admin/reports/topwinners", adminAuth, async (req, res) => {
 let gameConfig = { paused: false, minBet: 10, maxBet: 50000, bannerMsg: "" };
 
 app.get("/api/admin/game/config", adminAuth, (req, res) => res.json(gameConfig));
+app.get("/api/game/config", (req, res) => res.json({ paused: gameConfig.paused, bannerMsg: gameConfig.bannerMsg, minBet: gameConfig.minBet, maxBet: gameConfig.maxBet }));
 
 app.post("/api/admin/game/pause", adminAuth, (req, res) => {
   gameConfig.paused = req.body.paused;
