@@ -344,7 +344,16 @@ app.get("/api/admin/users/:id", adminAuth, async (req, res) => {
 
 app.post("/api/admin/users/:id/balance", adminAuth, async (req, res) => {
   const { amount, note } = req.body;
-  if (!amount || isNaN(parseFloat(amount))) return res.status(400).json({ error: "Invalid amount" });
+  const parsed = parseFloat(amount);
+  if (isNaN(parsed) || parsed === 0) return res.status(400).json({ error: "Invalid amount" });
+  try {
+    const updated = await pool.query("UPDATE users SET balance=balance+$1 WHERE id=$2 RETURNING balance", [parsed, req.params.id]);
+    const txType = parsed > 0 ? "dep" : "wd";
+    const txLabel = note || (parsed > 0 ? "Admin credit" : "Admin debit");
+    await pool.query("INSERT INTO transactions (user_id,type,label,amount) VALUES($1,$2,$3,$4)", [req.params.id, txType, txLabel, parsed]);
+    res.json({ ok: true, balance: parseFloat(updated.rows[0].balance) });
+  } catch(err) { console.error(err); res.status(500).json({ error: "Failed to adjust balance" }); }
+});
   try {
     const updated = await pool.query("UPDATE users SET balance=balance+$1 WHERE id=$2 RETURNING balance", [parseFloat(amount), req.params.id]);
     if (!updated.rows.length) return res.status(404).json({ error: "User not found" });
