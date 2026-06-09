@@ -365,11 +365,25 @@ app.get("/api/admin/transactions", adminAuth, async (req, res) => {
   const { type = "", page = 1, limit = 50 } = req.query;
   const offset = (parseInt(page)-1)*parseInt(limit);
   try {
-    const filter = type ? `AND t.type='${type}'` : "";
-    const result = await pool.query(`SELECT t.*,u.first_name,u.last_name,u.phone FROM transactions t LEFT JOIN users u ON u.id=t.user_id WHERE 1=1 ${filter} ORDER BY t.created_at DESC LIMIT $1 OFFSET $2`, [parseInt(limit), offset]);
-    const count = await pool.query(`SELECT COUNT(*) FROM transactions WHERE 1=1 ${filter}`);
+    let result, count;
+    if (type) {
+      result = await pool.query(
+        `SELECT t.*,u.first_name,u.last_name,u.phone FROM transactions t LEFT JOIN users u ON u.id=t.user_id WHERE t.type=$1 ORDER BY t.created_at DESC LIMIT $2 OFFSET $3`,
+        [type, parseInt(limit), offset]
+      );
+      count = await pool.query(`SELECT COUNT(*) FROM transactions WHERE type=$1`, [type]);
+    } else {
+      result = await pool.query(
+        `SELECT t.*,u.first_name,u.last_name,u.phone FROM transactions t LEFT JOIN users u ON u.id=t.user_id ORDER BY t.created_at DESC LIMIT $1 OFFSET $2`,
+        [parseInt(limit), offset]
+      );
+      count = await pool.query(`SELECT COUNT(*) FROM transactions`);
+    }
     res.json({ transactions: result.rows, total: parseInt(count.rows[0].count) });
-  } catch { res.status(500).json({ error: "Failed to fetch transactions" }); }
+  } catch(err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to fetch transactions" });
+  }
 });
 
 app.get("/api/admin/rounds", adminAuth, async (req, res) => {
