@@ -28,10 +28,8 @@ const JWT_SECRET = process.env.JWT_SECRET || "avipesa_secret";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "avipesa_admin_2024";
 
 function generateAviId() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let id = "AVI";
-  for (let i = 0; i < 4; i++) id += chars[Math.floor(Math.random() * chars.length)];
-  return id;
+  const num = Math.floor(1000 + Math.random() * 9000);
+  return "AVI" + num;
 }
 
 async function assignAviId(userId) {
@@ -440,11 +438,9 @@ app.get("/api/admin/gamestats", adminAuth, async (req, res) => {
   } catch { res.status(500).json({ error: "Failed to fetch game stats" }); }
 });
 
-const BOT_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 function randomAviId() {
-  let id = "AVI";
-  for (let i = 0; i < 4; i++) id += BOT_CHARS[Math.floor(Math.random() * BOT_CHARS.length)];
-  return id;
+  const num = Math.floor(1000 + Math.random() * 9000);
+  return "AVI" + num;
 }
 
 let gameState = { state:"waiting", multiplier:1, countdown:5, crashPoint:2, roundId:null, history:[], bets:[], startTime:null, serverSeed:null, serverSeedHash:null };
@@ -467,16 +463,11 @@ function getAutoCashoutTarget(socketId,panelId) {
 }
 
 function getBetsArray() {
-  const arr = [...activeBets.values()].map(b=>({id:b.userId||b.socketId,name:b.name,bet:b.amount,cashed:b.cashedOut,cashMult:b.cashMult||null}));
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [arr[i], arr[j]] = [arr[j], arr[i]];
-  }
-  return arr;
+  return [...activeBets.values()].map(b=>({id:b.userId||b.socketId,name:b.name,bet:b.amount,cashed:b.cashedOut,cashMult:b.cashMult||null}));
 }
 
 function spawnBots() {
-  const count = 300 + Math.floor(Math.random() * 501);
+  const count = 30 + Math.floor(Math.random() * 31);
   const betOptions = [10,25,50,100,200,500,1000,2000,5000];
   for (let i = 0; i < count; i++) {
     const key = `bot_${i}_${Date.now()}`;
