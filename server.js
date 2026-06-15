@@ -609,7 +609,7 @@ function startFlight() {
 }
 
 async function endRound(finalMult) {
-  gameState.state="crashed"; gameState.history=[finalMult,...gameState.history].slice(0,24); gameState.bets=getBetsArray();
+  gameState.state="crashed"; gameState.history=[finalMult,...gameState.history].slice(0,32); gameState.bets=getBetsArray();
   io.emit("game:crashed",{multiplier:finalMult,roundId:gameState.roundId,bets:gameState.bets,hash:gameState.serverSeedHash,seed:gameState.serverSeed});
   activeBets.clear(); setTimeout(startWaiting,4000);
 }
