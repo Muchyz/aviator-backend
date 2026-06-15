@@ -165,31 +165,27 @@ function crashPointFromSeed(seed) {
   const h = parseInt(hmac.slice(0, 8), 16);
   const e = Math.pow(2, 32);
   const rand = h / e;
+  const r2 = parseInt(hmac.slice(8, 16), 16) / e;
 
-  // Weighted distribution:
-  // 60% chance: 10x - 86x (high multipliers)
-  // 20% chance: 3x - 9.99x (medium)
-  // 10% chance: 1.36x - 1.98x (low)
-  // 10% chance: 2x - 2.99x (mid-low)
+  // Weighted distribution (per 10 rounds):
+  // 2/10 -> 1.40x - 1.69x
+  // 4/10 -> 2.00x - 2.83x
+  // 1/10 -> 7.02x - 8.6x
+  // 2/10 -> 50x+
+  // 1/10 -> 3x - 6.99x (filler)
 
   let result;
 
-  if (rand < 0.60) {
-    // High: 10x to 86x
-    const r2 = parseInt(hmac.slice(8, 16), 16) / e;
-    result = 10 + Math.pow(r2, 0.6) * 76;
-  } else if (rand < 0.80) {
-    // Medium: 3x to 9.99x
-    const r2 = parseInt(hmac.slice(8, 16), 16) / e;
-    result = 3 + r2 * 6.99;
+  if (rand < 0.20) {
+    result = 1.40 + r2 * 0.29;
+  } else if (rand < 0.60) {
+    result = 2.00 + r2 * 0.83;
+  } else if (rand < 0.70) {
+    result = 7.02 + r2 * 1.58;
   } else if (rand < 0.90) {
-    // Mid-low: 2x to 2.99x
-    const r2 = parseInt(hmac.slice(8, 16), 16) / e;
-    result = 2 + r2 * 0.99;
+    result = 50 + Math.pow(r2, 0.6) * 36;
   } else {
-    // Low: 1.36x to 1.98x
-    const r2 = parseInt(hmac.slice(8, 16), 16) / e;
-    result = 1.36 + r2 * 0.62;
+    result = 3 + r2 * 3.99;
   }
 
   return parseFloat(Math.max(1.01, result).toFixed(2));
