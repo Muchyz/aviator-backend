@@ -467,8 +467,23 @@ const BOT_NAMES = [
   "ChepkN***","MutisoP***","AkinyiL***","OdedaR***","KiptooS***","MumboT***",
   "WambuiK***","OtienoH***","NdunguF***","MwendeC***","KilonzoB***","RutoA***",
   "NjokiV***","MaingiE***","SitatiZ***","KemboiQ***","AuduU***","WafulaY***",
-  "MugoX***","KarimiI***","OkothJ***","ChelangaO***","BiwottN***","MakoryaM***"
+  "MugoX***","KarimiI***","OkothJ***","ChelangaO***","BiwottN***","MakoryaM***",
+  "KiplagN***","MwauraT***","NyongoS***","TumaJ***","WekesaR***","OchiengD***",
+  "KipkoechL***","NaliakaP***","MuthoniB***","GachieK***","RotichV***","OmondiZ***",
+  "AwinoQ***","MutuaC***","WairimuG***","CherutoH***","SilantoiY***","ImaliF***",
+  "NyaboLs***","KipruE***","MasinoT***","AchengW***","BosireU***","LangatI***",
+  "MboyaJ***","KinyuaA***","NyakioR***","OumaB***","SangN***","TanuiX***",
+  "WafutaM***","YusufO***","ZawadiK***","AdongoP***","BetancoK***"
 ];
+
+function shuffledBotNames() {
+  const arr = [...BOT_NAMES];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
 
 function randomAviId() {
   return BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)];
@@ -500,12 +515,20 @@ function getBetsArray() {
 function spawnBots() {
   const count = 30 + Math.floor(Math.random() * 31);
   const betOptions = [10,25,50,100,200,500,1000,2000,5000];
+  const namePool = shuffledBotNames();
   for (let i = 0; i < count; i++) {
     const key = `bot_${i}_${Date.now()}`;
+    let name;
+    if (i < namePool.length) {
+      name = namePool[i];
+    } else {
+      const base = namePool[i % namePool.length];
+      name = `${base}${Math.floor(10 + Math.random() * 90)}`;
+    }
     activeBets.set(key, {
       userId: null,
       socketId: key,
-      name: randomAviId(),
+      name,
       amount: betOptions[Math.floor(Math.random() * betOptions.length)],
       cashedOut: false,
       cashMult: null,
