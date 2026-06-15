@@ -461,9 +461,17 @@ app.get("/api/admin/gamestats", adminAuth, async (req, res) => {
   } catch { res.status(500).json({ error: "Failed to fetch game stats" }); }
 });
 
+const BOT_NAMES = [
+  "KipC***","WanjiM***","OmonB***","Amina***","JohnK***","FatumA***","MwanM***",
+  "NjorO***","KamauW***","AchiD***","BarasaO***","WaweruJ***","NyamboG***",
+  "ChepkN***","MutisoP***","AkinyiL***","OdedaR***","KiptooS***","MumboT***",
+  "WambuiK***","OtienoH***","NdunguF***","MwendeC***","KilonzoB***","RutoA***",
+  "NjokiV***","MaingiE***","SitatiZ***","KemboiQ***","AuduU***","WafulaY***",
+  "MugoX***","KarimiI***","OkothJ***","ChelangaO***","BiwottN***","MakoryaM***"
+];
+
 function randomAviId() {
-  const num = Math.floor(1000 + Math.random() * 9000);
-  return "AVI" + num;
+  return BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)];
 }
 
 let gameState = { state:"waiting", multiplier:1, countdown:5, crashPoint:2, roundId:null, history:[], bets:[], startTime:null, serverSeed:null, serverSeedHash:null };
