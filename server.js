@@ -566,8 +566,7 @@ async function startWaiting() {
   try {
     const serverSeed=generateServerSeed();
     const serverSeedHash=hashServerSeed(serverSeed);
-    const hasRealBets=[...activeBets.values()].some(b=>!b.isBot);
-    const cp=crashPointFromSeed(serverSeed,hasRealBets);
+    const cp=crashPointFromSeed(serverSeed,false);
     const r=await pool.query("INSERT INTO game_rounds (crash_point,server_seed,server_seed_hash) VALUES($1,$2,$3) RETURNING id",[cp,serverSeed,serverSeedHash]);
     gameState.roundId=r.rows[0].id; gameState.crashPoint=cp; gameState.serverSeed=serverSeed; gameState.serverSeedHash=serverSeedHash;
   } catch(err) {
@@ -579,7 +578,17 @@ async function startWaiting() {
   let c=5;
   const cdInterval=setInterval(()=>{
     c--; gameState.countdown=c; io.emit("game:countdown",{countdown:c});
-    if(c<=0){clearInterval(cdInterval);startFlight();}
+    if(c<=0){
+      const realBets=[...activeBets.values()].some(b=>!b.isBot);
+      if(realBets){
+        const s=generateServerSeed();
+        const adjusted=crashPointFromSeed(s,true);
+        gameState.crashPoint=adjusted;
+        gameState.serverSeed=s;
+        gameState.serverSeedHash=hashServerSeed(s);
+      }
+      clearInterval(cdInterval);startFlight();
+    }
   },1000);
 }
 
