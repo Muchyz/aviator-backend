@@ -160,20 +160,20 @@ function hashServerSeed(seed) {
   return crypto.createHash("sha256").update(seed).digest("hex");
 }
 
-function crashPointFromSeed(seed) {
+function crashPointFromSeed(seed, hasRealBets) {
   const hmac = crypto.createHmac("sha256", seed).update("aviator").digest("hex");
   const h = parseInt(hmac.slice(0, 8), 16);
   const e = Math.pow(2, 32);
   const rand = h / e;
   const r2 = parseInt(hmac.slice(8, 16), 16) / e;
 
-  // Weighted distribution (per 10 rounds):
-  // 2/10 -> 1.40x - 1.69x
-  // 4/10 -> 2.00x - 2.83x
-  // 1/10 -> 7.02x - 8.6x
-  // 2/10 -> 50x+
-  // 1/10 -> 3x - 6.99x (filler)
+  // If real users have placed bets, keep it low
+  if (hasRealBets) {
+    const result = 1.43 + r2 * 0.43;
+    return parseFloat(Math.max(1.43, Math.min(1.86, result)).toFixed(2));
+  }
 
+  // Normal distribution when no real bets
   let result;
 
   if (rand < 0.20) {
@@ -566,7 +566,8 @@ async function startWaiting() {
   try {
     const serverSeed=generateServerSeed();
     const serverSeedHash=hashServerSeed(serverSeed);
-    const cp=crashPointFromSeed(serverSeed);
+    const hasRealBets=[...activeBets.values()].some(b=>!b.isBot);
+    const cp=crashPointFromSeed(serverSeed,hasRealBets);
     const r=await pool.query("INSERT INTO game_rounds (crash_point,server_seed,server_seed_hash) VALUES($1,$2,$3) RETURNING id",[cp,serverSeed,serverSeedHash]);
     gameState.roundId=r.rows[0].id; gameState.crashPoint=cp; gameState.serverSeed=serverSeed; gameState.serverSeedHash=serverSeedHash;
   } catch(err) {
